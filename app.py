@@ -3,6 +3,8 @@ import uuid
 import hashlib
 import subprocess
 import requests
+import boto3
+from botocore.config import Config
 from flask import Flask, request, jsonify
 
 # Install ffmpeg at runtime if not available
@@ -10,73 +12,43 @@ os.system("apt-get update -qq && apt-get install -y ffmpeg -qq")
 
 app = Flask(__name__)
 
-B2_KEY_ID = os.environ.get('B2_APPLICATION_KEY_ID')
-B2_APP_KEY = os.environ.get('B2_APPLICATION_KEY')
-B2_BUCKET_ID = os.environ.get('B2_BUCKET_ID')
-B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
+R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
+R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
+R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
+R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 
-INTRO_B2_PATH = 'assets/intro.mp4'
-OUTRO_B2_PATH = 'assets/outro.mp4'
+INTRO_PATH = 'assets/intro.mp4'
+OUTRO_PATH = 'assets/outro.mp4'
 
 
-def b2_authorize():
-    r = requests.get(
-        'https://api.backblazeb2.com/b2api/v2/b2_authorize_account',
-        auth=(B2_KEY_ID, B2_APP_KEY)
+def get_r2_client():
+    return boto3.client(
+        's3',
+        endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version='s3v4'),
+        region_name='auto'
     )
-    data = r.json()
-    print(f"B2 auth response: {data}")
-    if 'authorizationToken' not in data:
-        raise Exception(f"B2 auth failed: {data}")
-    return {
-        'token': data['authorizationToken'],
-        'api_url': data['apiUrl'],
-        'download_url': data['downloadUrl']
-    }
 
 
-def b2_download_file(auth, bucket_name, b2_path, local_path):
-    url = f"{auth['download_url']}/file/{bucket_name}/{b2_path}"
-    r = requests.get(url, headers={'Authorization': auth['token']}, stream=True)
-    with open(local_path, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
+def r2_download_file(r2, key, local_path):
+    print(f"Downloading {key} from R2")
+    r2.download_file(R2_BUCKET_NAME, key, local_path)
+    print(f"Downloaded {key}")
 
 
-def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
-    r = requests.post(
-        f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
-        headers={'Authorization': auth['token']},
-        json={'bucketId': bucket_id}
-    )
-    upload_data = r.json()
-
+def r2_upload_file(r2, local_path, key, content_type):
     file_size = os.path.getsize(local_path)
-    sha1 = hashlib.sha1()
-    with open(local_path, 'rb') as f:
-        for chunk in iter(lambda: f.read(65536), b''):
-            sha1.update(chunk)
-    sha1_hex = sha1.hexdigest()
-
-    print(f"Uploading {local_path} ({file_size} bytes) to B2 as {b2_path}")
-    with open(local_path, 'rb') as f:
-        r = requests.post(
-            upload_data['uploadUrl'],
-            headers={
-                'Authorization': upload_data['authorizationToken'],
-                'X-Bz-File-Name': b2_path,
-                'Content-Type': content_type,
-                'Content-Length': str(file_size),
-                'X-Bz-Content-Sha1': sha1_hex
-            },
-            data=f
-        )
-
-    if r.status_code != 200:
-        raise Exception(f"B2 upload failed: {r.json()}")
-
-    print(f"Upload complete: {b2_path}")
-    return f"{auth['download_url']}/file/{B2_BUCKET_NAME}/{b2_path}"
+    print(f"Uploading {local_path} ({file_size} bytes) to R2 as {key}")
+    r2.upload_file(
+        local_path,
+        R2_BUCKET_NAME,
+        key,
+        ExtraArgs={'ContentType': content_type}
+    )
+    print(f"Upload complete: {key}")
+    return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
 
 
 @app.route('/health', methods=['GET'])
@@ -87,12 +59,12 @@ def health():
 @app.route('/process', methods=['POST'])
 def process_video():
     data = request.get_json()
-    raw_url = data.get('raw_url')
+    raw_key = data.get('raw_key')  # R2 key e.g. raw-intake/myvideo.mp4
     cuts = data.get('cuts', [])
     transcript = data.get('transcript', '')
 
-    if not raw_url:
-        return jsonify({'status': 'error', 'message': 'raw_url required'}), 400
+    if not raw_key:
+        return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
 
     job_id = str(uuid.uuid4())
     work_dir = f'/tmp/{job_id}'
@@ -110,22 +82,15 @@ def process_video():
     output_path = f'{work_dir}/final.mp4'
 
     try:
-        auth = b2_authorize()
-        bucket_id = B2_BUCKET_ID
+        r2 = get_r2_client()
 
-        # Download raw video with auth
-        print(f"Downloading raw video from {raw_url}")
-        r = requests.get(raw_url, headers={'Authorization': auth['token']}, stream=True)
-        with open(raw_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+        # Download raw video, intro, outro from R2
+        print(f"Downloading raw video: {raw_key}")
+        r2_download_file(r2, raw_key, raw_path)
+        r2_download_file(r2, INTRO_PATH, intro_raw_path)
+        r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
-        # Download intro and outro
-        print("Downloading intro and outro")
-        b2_download_file(auth, B2_BUCKET_NAME, INTRO_B2_PATH, intro_raw_path)
-        b2_download_file(auth, B2_BUCKET_NAME, OUTRO_B2_PATH, outro_raw_path)
-
-        # Pre-process intro: normalize to 30fps, mono audio, 1920x1080, fade out
+        # Pre-process intro: normalize to 30fps, mono, 1920x1080, fade out
         print("Pre-processing intro")
         subprocess.run([
             'ffmpeg', '-y', '-i', intro_raw_path,
@@ -136,7 +101,7 @@ def process_video():
             intro_path
         ], check=True)
 
-        # Pre-process outro: normalize to 30fps, mono audio, 1920x1080, fade in
+        # Pre-process outro: normalize to 30fps, mono, 1920x1080, fade in
         print("Pre-processing outro")
         subprocess.run([
             'ffmpeg', '-y', '-i', outro_raw_path,
@@ -147,7 +112,7 @@ def process_video():
             outro_path
         ], check=True)
 
-        # PASS 1 — Trim silence from start using copy (fast, no re-encode)
+        # PASS 1 — Trim silence from start
         print("Pass 1: Trimming silence from start")
         subprocess.run([
             'ffmpeg', '-y', '-i', raw_path,
@@ -194,7 +159,7 @@ def process_video():
             padded_path
         ], check=True)
 
-        # PASS 3 — Concat intro + main + outro, re-encode to fix audio sync
+        # PASS 3 — Concat intro + main + outro, re-encode for audio sync
         print("Pass 3: Concatenating intro + main + outro")
         with open(concat_list_path, 'w') as f:
             f.write(f"file '{intro_path}'\n")
@@ -211,10 +176,10 @@ def process_video():
             output_path
         ], check=True)
 
-        # Upload final video to B2 (streaming)
-        print("Uploading final video to B2")
-        video_b2_path = f'exports/final_{job_id}.mp4'
-        output_url = b2_upload_file(auth, bucket_id, output_path, video_b2_path, 'video/mp4')
+        # Upload final video to R2
+        print("Uploading final video to R2")
+        video_key = f'exports/final_{job_id}.mp4'
+        output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
 
         # Upload transcript if provided
         transcript_url = None
@@ -222,10 +187,8 @@ def process_video():
             transcript_path = f'{work_dir}/transcript.txt'
             with open(transcript_path, 'w') as f:
                 f.write(transcript)
-            transcript_b2_path = f'exports/transcript_{job_id}.txt'
-            transcript_url = b2_upload_file(
-                auth, bucket_id, transcript_path, transcript_b2_path, 'text/plain'
-            )
+            transcript_key = f'exports/transcript_{job_id}.txt'
+            transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
 
         # Cleanup
         subprocess.run(['rm', '-rf', work_dir])
