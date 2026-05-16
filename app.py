@@ -19,7 +19,6 @@ def b2_authorize():
         auth=(B2_KEY_ID, B2_APP_KEY)
     )
     data = r.json()
-    print(f"B2 auth response: {data}")
     if 'authorizationToken' not in data:
         raise Exception(f"B2 auth failed: {data}")
     return {
@@ -59,6 +58,12 @@ def b2_upload_file(auth, file_path, b2_path, content_type):
 def b2_get_download_url(auth, b2_path):
     return f"{auth['download_url']}/file/{B2_BUCKET_NAME}/{b2_path}"
 
+def download_b2_file(url, dest_path, token):
+    req = urllib.request.Request(url, headers={'Authorization': token})
+    with urllib.request.urlopen(req) as response:
+        with open(dest_path, 'wb') as f:
+            f.write(response.read())
+
 def time_to_seconds(t):
     parts = t.split(':')
     return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
@@ -90,20 +95,10 @@ def process_video():
     intro_url = b2_get_download_url(auth, 'assets/intro.mp4')
     outro_url = b2_get_download_url(auth, 'assets/outro.mp4')
 
-    # Download all files using authenticated B2 URL
-    auth_headers = {'Authorization': auth['token']}
-    
-    def download_b2_file(url, dest_path):
-        req = urllib.request.Request(url, headers=auth_headers)
-        with urllib.request.urlopen(req) as response:
-            with open(dest_path, 'wb') as f:
-                f.write(response.read())
-    
-    download_b2_file(raw_url, raw_path)
-    urllib.request.urlretrieve(intro_url, intro_path)
-    urllib.request.urlretrieve(outro_url, outro_path)
-    urllib.request.urlretrieve(intro_url, intro_path)
-    urllib.request.urlretrieve(outro_url, outro_path)
+    # Download all files using authenticated requests
+    download_b2_file(raw_url, raw_path, auth['token'])
+    download_b2_file(intro_url, intro_path, auth['token'])
+    download_b2_file(outro_url, outro_path, auth['token'])
 
     # Step 1 — Remove silence at start and end
     subprocess.run([
