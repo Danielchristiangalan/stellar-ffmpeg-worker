@@ -98,6 +98,8 @@ def process_video():
     trimmed_path = f'{work_dir}/trimmed.mp4'
     cut_path = f'{work_dir}/cut.mp4'
     padded_path = f'{work_dir}/padded.mp4'
+    intro_raw_path = f'{work_dir}/intro_raw.mp4'
+    outro_raw_path = f'{work_dir}/outro_raw.mp4'
     intro_path = f'{work_dir}/intro.mp4'
     outro_path = f'{work_dir}/outro.mp4'
     with_intro_path = f'{work_dir}/with_intro.mp4'
@@ -116,8 +118,30 @@ def process_video():
 
         # Download intro and outro
         print("Downloading intro and outro")
-        b2_download_file(auth, B2_BUCKET_NAME, INTRO_B2_PATH, intro_path)
-        b2_download_file(auth, B2_BUCKET_NAME, OUTRO_B2_PATH, outro_path)
+        b2_download_file(auth, B2_BUCKET_NAME, INTRO_B2_PATH, intro_raw_path)
+        b2_download_file(auth, B2_BUCKET_NAME, OUTRO_B2_PATH, outro_raw_path)
+
+        # Pre-process intro: normalize to 30fps, mono audio, 1920x1080
+        print("Pre-processing intro")
+        subprocess.run([
+            'ffmpeg', '-y', '-i', intro_raw_path,
+            '-vf', 'fps=30,scale=1920:1080',
+            '-af', 'aformat=channel_layouts=mono',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
+            intro_path
+        ], check=True)
+
+        # Pre-process outro: normalize to 30fps, mono audio, 1920x1080
+        print("Pre-processing outro")
+        subprocess.run([
+            'ffmpeg', '-y', '-i', outro_raw_path,
+            '-vf', 'fps=30,scale=1920:1080',
+            '-af', 'aformat=channel_layouts=mono',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
+            outro_path
+        ], check=True)
 
         # PASS 1 — Trim silence from start using copy (fast, no re-encode)
         print("Pass 1: Trimming silence from start")
@@ -149,7 +173,7 @@ def process_video():
         else:
             cut_path = trimmed_path
 
-        # PASS 2 — Pad to 1920x1080 with white background, normalize to 30fps
+        # PASS 2 — Pad to 1920x1080 with white background, normalize to 30fps mono
         print("Pass 2: Padding to 1920x1080")
         subprocess.run([
             'ffmpeg', '-y', '-i', cut_path,
@@ -158,20 +182,20 @@ def process_video():
                 'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white,'
                 'fps=30'
             ),
+            '-af', 'aformat=channel_layouts=mono',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac',
+            '-c:a', 'aac', '-ar', '48000',
             padded_path
         ], check=True)
 
-        # PASS 3 — Crossfade intro (normalize both to 30fps before xfade)
+        # PASS 3 — Crossfade intro (all streams now matched: 30fps, mono, 48kHz)
         print("Pass 3: Adding intro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', intro_path,
             '-i', padded_path,
             '-filter_complex',
-            f'[0:v]fps=30[v0];[1:v]fps=30[v1];'
-            f'[v0][v1]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
+            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
@@ -179,15 +203,14 @@ def process_video():
             with_intro_path
         ], check=True)
 
-        # PASS 4 — Crossfade outro (normalize both to 30fps before xfade)
+        # PASS 4 — Crossfade outro (all streams matched)
         print("Pass 4: Adding outro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', with_intro_path,
             '-i', outro_path,
             '-filter_complex',
-            f'[0:v]fps=30[v0];[1:v]fps=30[v1];'
-            f'[v0][v1]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
+            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
