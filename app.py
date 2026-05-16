@@ -22,10 +22,15 @@ R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
 INTRO_PATH = 'assets/intro.mp4'
 OUTRO_PATH = 'assets/outro.mp4'
 
-# Intro/outro durations for fade processing
 INTRO_DURATION = 4.12
 OUTRO_DURATION = 4.0
 FADE_DURATION = 0.5
+
+# Silence detection settings
+# -35dB catches real silence but ignores speech pauses
+# 1.5s minimum duration ignores brief pauses between words
+SILENCE_THRESHOLD_DB = -35
+SILENCE_MIN_DURATION = 1.5
 
 
 def get_r2_client():
@@ -59,7 +64,6 @@ def r2_upload_file(r2, local_path, key, content_type):
 
 
 def get_video_duration(path):
-    """Get video duration in seconds using ffprobe."""
     result = subprocess.run([
         'ffprobe', '-v', 'quiet',
         '-print_format', 'json',
@@ -72,11 +76,10 @@ def get_video_duration(path):
     return duration
 
 
-def detect_silence(path, noise_threshold=-40, min_duration=0.3):
-    """Detect silence periods in video. Returns list of (start, end) tuples."""
+def detect_silence(path):
     result = subprocess.run([
         'ffmpeg', '-i', path,
-        '-af', f'silencedetect=noise={noise_threshold}dB:d={min_duration}',
+        '-af', f'silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={SILENCE_MIN_DURATION}',
         '-f', 'null', '-'
     ], capture_output=True, text=True)
 
@@ -95,27 +98,29 @@ def detect_silence(path, noise_threshold=-40, min_duration=0.3):
                 silence_periods.append((silence_start, silence_end))
                 silence_start = None
 
+    print(f"Detected silence periods: {silence_periods}")
     return silence_periods
 
 
 def get_trim_points(path, duration):
-    """Auto-detect start and end trim points based on silence."""
     silence = detect_silence(path)
-    print(f"Detected silence periods: {silence}")
 
-    # Default: no trim
     trim_start = 0.0
     trim_end = duration
 
-    # Trim leading silence
-    if silence and silence[0][0] < 1.0:
+    # Only trim leading silence if it starts within first 5 seconds
+    if silence and silence[0][0] < 5.0:
         trim_start = silence[0][1]
         print(f"Trimming {trim_start:.2f}s of leading silence")
+    else:
+        print("No leading silence detected, starting from 0")
 
-    # Trim trailing silence
-    if silence and silence[-1][1] > duration - 2.0:
+    # Only trim trailing silence if it ends within last 5 seconds
+    if silence and silence[-1][1] > duration - 5.0:
         trim_end = silence[-1][0]
         print(f"Trimming trailing silence, new end: {trim_end:.2f}s")
+    else:
+        print("No trailing silence detected, keeping full end")
 
     return trim_start, trim_end
 
@@ -189,13 +194,14 @@ def process_video():
         trim_duration = trim_end - trim_start
         print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
 
-        # PASS 1 — Trim silence using detected points
+        # PASS 1 — Trim silence, re-encode to fix audio sync
         print("Pass 1: Trimming silence")
         subprocess.run([
             'ffmpeg', '-y', '-i', raw_path,
             '-ss', str(trim_start),
             '-t', str(trim_duration),
-            '-c', 'copy',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
             trimmed_path
         ], check=True)
 
@@ -222,7 +228,7 @@ def process_video():
 
         # Get duration of cut video for fade out timing
         cut_duration = get_video_duration(cut_path)
-        fade_out_start = cut_duration - FADE_DURATION
+        fade_out_start = max(0, cut_duration - FADE_DURATION)
         print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
 
         # PASS 2 — Pad to 1920x1080, normalize to 30fps mono, auto fade in/out
@@ -246,7 +252,7 @@ def process_video():
             padded_path
         ], check=True)
 
-        # PASS 3 — Concat intro + main + outro, re-encode for audio sync
+        # PASS 3 — Concat intro + main + outro
         print("Pass 3: Concatenating intro + main + outro")
         with open(concat_list_path, 'w') as f:
             f.write(f"file '{intro_path}'\n")
@@ -259,7 +265,7 @@ def process_video():
             '-i', concat_list_path,
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac', '-ar', '48000',
-            '-vsync', '1', '-async', '1',
+            '-vsync', 'cfr', '-async', '1',
             output_path
         ], check=True)
 
