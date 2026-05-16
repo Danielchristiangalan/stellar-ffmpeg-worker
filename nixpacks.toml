@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["ffmpeg", "python311"]
+nixPkgs = ["ffmpeg", "python313"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
 
 [start]
-cmd = "python app.py"
+cmd = "gunicorn app:app --bind 0.0.0.0:10000"
