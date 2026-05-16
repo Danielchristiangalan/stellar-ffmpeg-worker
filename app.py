@@ -87,8 +87,18 @@ def process_video():
     intro_url = b2_get_download_url(auth, 'assets/intro.mp4')
     outro_url = b2_get_download_url(auth, 'assets/outro.mp4')
 
-    # Download all files
-    urllib.request.urlretrieve(raw_url, raw_path)
+    # Download all files using authenticated B2 URL
+    auth_headers = {'Authorization': auth['token']}
+    
+    def download_b2_file(url, dest_path):
+        req = urllib.request.Request(url, headers=auth_headers)
+        with urllib.request.urlopen(req) as response:
+            with open(dest_path, 'wb') as f:
+                f.write(response.read())
+    
+    download_b2_file(raw_url, raw_path)
+    urllib.request.urlretrieve(intro_url, intro_path)
+    urllib.request.urlretrieve(outro_url, outro_path)
     urllib.request.urlretrieve(intro_url, intro_path)
     urllib.request.urlretrieve(outro_url, outro_path)
 
