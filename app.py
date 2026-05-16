@@ -1,3 +1,5 @@
+import os
+os.system("apt-get update -qq && apt-get install -y ffmpeg")
 from flask import Flask, request, jsonify
 import subprocess
 import os
