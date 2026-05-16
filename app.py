@@ -44,7 +44,6 @@ def b2_download_file(auth, bucket_name, b2_path, local_path):
 
 
 def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
-    # Get upload URL
     r = requests.post(
         f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
         headers={'Authorization': auth['token']},
@@ -52,7 +51,6 @@ def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
     )
     upload_data = r.json()
 
-    # Get file size and SHA1 without loading entire file into memory
     file_size = os.path.getsize(local_path)
     sha1 = hashlib.sha1()
     with open(local_path, 'rb') as f:
@@ -60,7 +58,6 @@ def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
             sha1.update(chunk)
     sha1_hex = sha1.hexdigest()
 
-    # Stream upload the file
     print(f"Uploading {local_path} ({file_size} bytes) to B2 as {b2_path}")
     with open(local_path, 'rb') as f:
         r = requests.post(
@@ -174,7 +171,7 @@ def process_video():
                 '-filter_complex', filter_complex,
                 '-map', '[v]', '-map', '[a]',
                 '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-c:a', 'aac',
+                '-c:a', 'aac', '-ar', '48000',
                 cut_path
             ], check=True)
         else:
@@ -197,7 +194,7 @@ def process_video():
             padded_path
         ], check=True)
 
-        # PASS 3 — Concat intro + main + outro using concat demuxer (low memory)
+        # PASS 3 — Concat intro + main + outro, re-encode to fix audio sync
         print("Pass 3: Concatenating intro + main + outro")
         with open(concat_list_path, 'w') as f:
             f.write(f"file '{intro_path}'\n")
@@ -208,7 +205,9 @@ def process_video():
             'ffmpeg', '-y',
             '-f', 'concat', '-safe', '0',
             '-i', concat_list_path,
-            '-c', 'copy',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
+            '-async', '1',
             output_path
         ], check=True)
 
