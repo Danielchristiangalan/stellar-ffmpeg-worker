@@ -19,6 +19,9 @@ def b2_authorize():
         auth=(B2_KEY_ID, B2_APP_KEY)
     )
     data = r.json()
+    print(f"B2 auth response: {data}")
+    if 'authorizationToken' not in data:
+        raise Exception(f"B2 auth failed: {data}")
     return {
         'token': data['authorizationToken'],
         'api_url': data['apiUrl'],
