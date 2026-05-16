@@ -1,19 +1,22 @@
 import os
-os.system("apt-get update -qq && apt-get install -y ffmpeg")
-from flask import Flask, request, jsonify
-import subprocess
-import os
-import urllib.request
 import uuid
+import subprocess
 import requests
-import hashlib
+from flask import Flask, request, jsonify
+
+# Install ffmpeg at runtime if not available
+os.system("apt-get update -qq && apt-get install -y ffmpeg -qq")
 
 app = Flask(__name__)
 
 B2_KEY_ID = os.environ.get('B2_APPLICATION_KEY_ID')
 B2_APP_KEY = os.environ.get('B2_APPLICATION_KEY')
-B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
 B2_BUCKET_ID = os.environ.get('B2_BUCKET_ID')
+B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
+
+INTRO_B2_PATH = 'assets/intro.mp4'
+OUTRO_B2_PATH = 'assets/outro.mp4'
+
 
 def b2_authorize():
     r = requests.get(
@@ -21,6 +24,7 @@ def b2_authorize():
         auth=(B2_KEY_ID, B2_APP_KEY)
     )
     data = r.json()
+    print(f"B2 auth response: {data}")
     if 'authorizationToken' not in data:
         raise Exception(f"B2 auth failed: {data}")
     return {
@@ -29,19 +33,30 @@ def b2_authorize():
         'download_url': data['downloadUrl']
     }
 
-def b2_get_upload_url(auth):
+
+def b2_download_file(auth, bucket_name, b2_path, local_path):
+    url = f"{auth['download_url']}/file/{bucket_name}/{b2_path}"
+    r = requests.get(url, headers={'Authorization': auth['token']}, stream=True)
+    with open(local_path, 'wb') as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+
+def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
+    # Get upload URL
     r = requests.post(
         f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
         headers={'Authorization': auth['token']},
-        json={'bucketId': B2_BUCKET_ID}
+        json={'bucketId': bucket_id}
     )
-    return r.json()
+    upload_data = r.json()
 
-def b2_upload_file(auth, file_path, b2_path, content_type):
-    upload_data = b2_get_upload_url(auth)
-    with open(file_path, 'rb') as f:
+    with open(local_path, 'rb') as f:
         file_data = f.read()
+
+    import hashlib
     sha1 = hashlib.sha1(file_data).hexdigest()
+
     r = requests.post(
         upload_data['uploadUrl'],
         headers={
@@ -53,150 +68,161 @@ def b2_upload_file(auth, file_path, b2_path, content_type):
         },
         data=file_data
     )
-    file_id = r.json()['fileId']
-    download_url = f"{auth['download_url']}/b2api/v2/b2_download_file_by_id?fileId={file_id}"
-    return download_url
-
-def b2_get_download_url(auth, b2_path):
+    result = r.json()
     return f"{auth['download_url']}/file/{B2_BUCKET_NAME}/{b2_path}"
 
-def download_b2_file(url, dest_path, token):
-    req = urllib.request.Request(url, headers={'Authorization': token})
-    with urllib.request.urlopen(req) as response:
-        with open(dest_path, 'wb') as f:
-            f.write(response.read())
 
-def time_to_seconds(t):
-    parts = t.split(':')
-    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
+
 
 @app.route('/process', methods=['POST'])
 def process_video():
-    data = request.json
-    raw_url = data['raw_url']
+    data = request.get_json()
+    raw_url = data.get('raw_url')
     cuts = data.get('cuts', [])
     transcript = data.get('transcript', '')
+
+    if not raw_url:
+        return jsonify({'status': 'error', 'message': 'raw_url required'}), 400
 
     job_id = str(uuid.uuid4())
     work_dir = f'/tmp/{job_id}'
     os.makedirs(work_dir, exist_ok=True)
 
     raw_path = f'{work_dir}/raw.mp4'
-    intro_path = f'{work_dir}/intro.mp4'
-    outro_path = f'{work_dir}/outro.mp4'
     trimmed_path = f'{work_dir}/trimmed.mp4'
     cut_path = f'{work_dir}/cut.mp4'
     padded_path = f'{work_dir}/padded.mp4'
+    intro_path = f'{work_dir}/intro.mp4'
+    outro_path = f'{work_dir}/outro.mp4'
     with_intro_path = f'{work_dir}/with_intro.mp4'
     output_path = f'{work_dir}/final.mp4'
 
-    # Authorize B2
-    auth = b2_authorize()
+    try:
+        auth = b2_authorize()
+        bucket_id = B2_BUCKET_ID
 
-    # Get intro and outro download URLs
-    intro_url = b2_get_download_url(auth, 'assets/intro.mp4')
-    outro_url = b2_get_download_url(auth, 'assets/outro.mp4')
+        # Download raw video
+        print(f"Downloading raw video from {raw_url}")
+        r = requests.get(raw_url, stream=True)
+        with open(raw_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
-    # Download all files using authenticated requests
-    download_b2_file(raw_url, raw_path, auth['token'])
-    download_b2_file(intro_url, intro_path, auth['token'])
-    download_b2_file(outro_url, outro_path, auth['token'])
+        # Download intro and outro
+        print("Downloading intro and outro")
+        b2_download_file(auth, B2_BUCKET_NAME, INTRO_B2_PATH, intro_path)
+        b2_download_file(auth, B2_BUCKET_NAME, OUTRO_B2_PATH, outro_path)
 
-    # Step 1 — Remove silence at start and end
-    subprocess.run([
-        'ffmpeg', '-i', raw_path,
-        '-ss', '0.5',
-        '-c:v', 'libx264', '-c:a', 'aac',
-        trimmed_path
-    ], check=True)
-
-    # Step 2 — Apply AI cuts
-    if cuts:
-        select_parts = []
-        for cut in cuts:
-            t_in = time_to_seconds(cut['in'])
-            t_out = time_to_seconds(cut['out'])
-            select_parts.append(f"between(t,{t_in},{t_out})")
-        select_expr = '+'.join(select_parts)
-        filter_complex = (
-            f"[0:v]select='not({select_expr})',setpts=N/FRAME_RATE/TB[v];"
-            f"[0:a]aselect='not({select_expr})',asetpts=N/SR/TB[a]"
-        )
+        # PASS 1 — Trim silence from start using copy (fast, no re-encode)
+        print("Pass 1: Trimming silence from start")
         subprocess.run([
-            'ffmpeg', '-i', trimmed_path,
-            '-filter_complex', filter_complex,
-            '-map', '[v]', '-map', '[a]',
-            '-c:v', 'libx264', '-c:a', 'aac',
-            cut_path
+            'ffmpeg', '-y', '-i', raw_path,
+            '-ss', '0.5',
+            '-c', 'copy',
+            trimmed_path
         ], check=True)
-    else:
-        cut_path = trimmed_path
 
-    # Step 3 — Add white background with margin
-    subprocess.run([
-        'ffmpeg', '-i', cut_path,
-        '-vf', (
-            'scale=1720:968:force_original_aspect_ratio=decrease,'
-            'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white'
-        ),
-        '-c:v', 'libx264', '-c:a', 'aac',
-        padded_path
-    ], check=True)
+        # PASS 1b — Apply cuts using copy (fast, no re-encode)
+        if cuts:
+            print(f"Pass 1b: Applying {len(cuts)} cuts")
+            select_expr = '+'.join([
+                f"between(t,{c['in']},{c['out']})" for c in cuts
+            ])
+            # For cuts we must re-encode (copy can't do selective filtering)
+            # but we do it on the already-trimmed file which is smaller
+            filter_complex = (
+                f"[0:v]select='not({select_expr})',setpts=N/FRAME_RATE/TB[v];"
+                f"[0:a]aselect='not({select_expr})',asetpts=N/SR/TB[a]"
+            )
+            subprocess.run([
+                'ffmpeg', '-y', '-i', trimmed_path,
+                '-filter_complex', filter_complex,
+                '-map', '[v]', '-map', '[a]',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+                '-c:a', 'aac',
+                cut_path
+            ], check=True)
+        else:
+            cut_path = trimmed_path
 
-    # Step 4 — Crossfade intro + padded video
-    subprocess.run([
-        'ffmpeg',
-        '-i', intro_path,
-        '-i', padded_path,
-        '-filter_complex',
-        '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
-        '[0:a][1:a]acrossfade=d=0.5[aout]',
-        '-map', '[vout]', '-map', '[aout]',
-        '-c:v', 'libx264', '-c:a', 'aac',
-        with_intro_path
-    ], check=True)
+        # PASS 2 — Pad to 1920x1080 with white background
+        print("Pass 2: Padding to 1920x1080")
+        subprocess.run([
+            'ffmpeg', '-y', '-i', cut_path,
+            '-vf', (
+                'scale=1720:968:force_original_aspect_ratio=decrease,'
+                'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white'
+            ),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac',
+            padded_path
+        ], check=True)
 
-    # Step 5 — Crossfade with outro
-    subprocess.run([
-        'ffmpeg',
-        '-i', with_intro_path,
-        '-i', outro_path,
-        '-filter_complex',
-        '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
-        '[0:a][1:a]acrossfade=d=0.5[aout]',
-        '-map', '[vout]', '-map', '[aout]',
-        '-c:v', 'libx264', '-c:a', 'aac',
-        output_path
-    ], check=True)
+        # PASS 3 — Crossfade intro
+        print("Pass 3: Adding intro")
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', intro_path,
+            '-i', padded_path,
+            '-filter_complex',
+            '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
+            '[0:a][1:a]acrossfade=d=0.5[aout]',
+            '-map', '[vout]', '-map', '[aout]',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac',
+            with_intro_path
+        ], check=True)
 
-    # Upload final video to B2 exports
-    video_b2_path = f'exports/final_{job_id}.mp4'
-    output_url = b2_upload_file(auth, output_path, video_b2_path, 'video/mp4')
+        # PASS 4 — Crossfade outro
+        print("Pass 4: Adding outro")
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', with_intro_path,
+            '-i', outro_path,
+            '-filter_complex',
+            '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
+            '[0:a][1:a]acrossfade=d=0.5[aout]',
+            '-map', '[vout]', '-map', '[aout]',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac',
+            output_path
+        ], check=True)
 
-    # Upload transcript to B2 exports
-    transcript_url = None
-    if transcript:
-        transcript_path = f'{work_dir}/transcript.txt'
-        with open(transcript_path, 'w') as f:
-            f.write(transcript)
-        transcript_b2_path = f'exports/transcript_{job_id}.txt'
-        transcript_url = b2_upload_file(
-            auth, transcript_path, transcript_b2_path, 'text/plain'
-        )
+        # Upload final video to B2
+        print("Uploading final video to B2")
+        video_b2_path = f'exports/final_{job_id}.mp4'
+        output_url = b2_upload_file(auth, bucket_id, output_path, video_b2_path, 'video/mp4')
 
-    # Cleanup
-    subprocess.run(['rm', '-rf', work_dir])
+        # Upload transcript if provided
+        transcript_url = None
+        if transcript:
+            transcript_path = f'{work_dir}/transcript.txt'
+            with open(transcript_path, 'w') as f:
+                f.write(transcript)
+            transcript_b2_path = f'exports/transcript_{job_id}.txt'
+            transcript_url = b2_upload_file(
+                auth, bucket_id, transcript_path, transcript_b2_path, 'text/plain'
+            )
 
-    return jsonify({
-        'status': 'complete',
-        'output_url': output_url,
-        'transcript_url': transcript_url,
-        'job_id': job_id
-    })
+        # Cleanup
+        subprocess.run(['rm', '-rf', work_dir])
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
+        return jsonify({
+            'status': 'complete',
+            'output_url': output_url,
+            'transcript_url': transcript_url,
+            'job_id': job_id
+        })
+
+    except Exception as e:
+        subprocess.run(['rm', '-rf', work_dir])
+        print(f"Pipeline error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
