@@ -17,11 +17,6 @@ B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
 INTRO_B2_PATH = 'assets/intro.mp4'
 OUTRO_B2_PATH = 'assets/outro.mp4'
 
-# Intro duration: 4.12s, offset = 4.12 - 0.5 = 3.62
-# Outro duration: 4.0s,  offset = 4.0  - 0.5 = 3.5
-INTRO_XFADE_OFFSET = 3.62
-OUTRO_XFADE_OFFSET = 3.5
-
 
 def b2_authorize():
     r = requests.get(
@@ -102,7 +97,7 @@ def process_video():
     outro_raw_path = f'{work_dir}/outro_raw.mp4'
     intro_path = f'{work_dir}/intro.mp4'
     outro_path = f'{work_dir}/outro.mp4'
-    with_intro_path = f'{work_dir}/with_intro.mp4'
+    concat_list_path = f'{work_dir}/concat.txt'
     output_path = f'{work_dir}/final.mp4'
 
     try:
@@ -121,23 +116,23 @@ def process_video():
         b2_download_file(auth, B2_BUCKET_NAME, INTRO_B2_PATH, intro_raw_path)
         b2_download_file(auth, B2_BUCKET_NAME, OUTRO_B2_PATH, outro_raw_path)
 
-        # Pre-process intro: normalize to 30fps, mono audio, 1920x1080
+        # Pre-process intro: normalize to 30fps, mono audio, 1920x1080, fade out
         print("Pre-processing intro")
         subprocess.run([
             'ffmpeg', '-y', '-i', intro_raw_path,
-            '-vf', 'fps=30,scale=1920:1080',
-            '-af', 'aformat=channel_layouts=mono',
+            '-vf', 'fps=30,scale=1920:1080,fade=t=out:st=3.62:d=0.5',
+            '-af', 'aformat=channel_layouts=mono,afade=t=out:st=3.62:d=0.5',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac', '-ar', '48000',
             intro_path
         ], check=True)
 
-        # Pre-process outro: normalize to 30fps, mono audio, 1920x1080
+        # Pre-process outro: normalize to 30fps, mono audio, 1920x1080, fade in
         print("Pre-processing outro")
         subprocess.run([
             'ffmpeg', '-y', '-i', outro_raw_path,
-            '-vf', 'fps=30,scale=1920:1080',
-            '-af', 'aformat=channel_layouts=mono',
+            '-vf', 'fps=30,scale=1920:1080,fade=t=in:st=0:d=0.5',
+            '-af', 'aformat=channel_layouts=mono,afade=t=in:st=0:d=0.5',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac', '-ar', '48000',
             outro_path
@@ -173,48 +168,35 @@ def process_video():
         else:
             cut_path = trimmed_path
 
-        # PASS 2 — Pad to 1920x1080 with white background, normalize to 30fps mono
+        # PASS 2 — Pad to 1920x1080, normalize to 30fps mono, fade in/out
         print("Pass 2: Padding to 1920x1080")
         subprocess.run([
             'ffmpeg', '-y', '-i', cut_path,
             '-vf', (
                 'scale=1720:968:force_original_aspect_ratio=decrease,'
                 'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white,'
-                'fps=30'
+                'fps=30,'
+                'fade=t=in:st=0:d=0.5,'
+                'fade=t=out:st=287:d=0.5'
             ),
-            '-af', 'aformat=channel_layouts=mono',
+            '-af', 'aformat=channel_layouts=mono,afade=t=in:st=0:d=0.5',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac', '-ar', '48000',
             padded_path
         ], check=True)
 
-        # PASS 3 — Crossfade intro (all streams now matched: 30fps, mono, 48kHz)
-        print("Pass 3: Adding intro")
-        subprocess.run([
-            'ffmpeg', '-y',
-            '-i', intro_path,
-            '-i', padded_path,
-            '-filter_complex',
-            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
-            '[0:a][1:a]acrossfade=d=0.5[aout]',
-            '-map', '[vout]', '-map', '[aout]',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac',
-            with_intro_path
-        ], check=True)
+        # PASS 3 — Concat intro + main + outro using concat demuxer (low memory)
+        print("Pass 3: Concatenating intro + main + outro")
+        with open(concat_list_path, 'w') as f:
+            f.write(f"file '{intro_path}'\n")
+            f.write(f"file '{padded_path}'\n")
+            f.write(f"file '{outro_path}'\n")
 
-        # PASS 4 — Crossfade outro (all streams matched)
-        print("Pass 4: Adding outro")
         subprocess.run([
             'ffmpeg', '-y',
-            '-i', with_intro_path,
-            '-i', outro_path,
-            '-filter_complex',
-            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
-            '[0:a][1:a]acrossfade=d=0.5[aout]',
-            '-map', '[vout]', '-map', '[aout]',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac',
+            '-f', 'concat', '-safe', '0',
+            '-i', concat_list_path,
+            '-c', 'copy',
             output_path
         ], check=True)
 
