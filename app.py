@@ -1,5 +1,6 @@
 import os
 import uuid
+import hashlib
 import subprocess
 import requests
 from flask import Flask, request, jsonify
@@ -43,6 +44,7 @@ def b2_download_file(auth, bucket_name, b2_path, local_path):
 
 
 def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
+    # Get upload URL
     r = requests.post(
         f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
         headers={'Authorization': auth['token']},
@@ -50,23 +52,33 @@ def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
     )
     upload_data = r.json()
 
+    # Get file size and SHA1 without loading entire file into memory
+    file_size = os.path.getsize(local_path)
+    sha1 = hashlib.sha1()
     with open(local_path, 'rb') as f:
-        file_data = f.read()
+        for chunk in iter(lambda: f.read(65536), b''):
+            sha1.update(chunk)
+    sha1_hex = sha1.hexdigest()
 
-    import hashlib
-    sha1 = hashlib.sha1(file_data).hexdigest()
+    # Stream upload the file
+    print(f"Uploading {local_path} ({file_size} bytes) to B2 as {b2_path}")
+    with open(local_path, 'rb') as f:
+        r = requests.post(
+            upload_data['uploadUrl'],
+            headers={
+                'Authorization': upload_data['authorizationToken'],
+                'X-Bz-File-Name': b2_path,
+                'Content-Type': content_type,
+                'Content-Length': str(file_size),
+                'X-Bz-Content-Sha1': sha1_hex
+            },
+            data=f
+        )
 
-    r = requests.post(
-        upload_data['uploadUrl'],
-        headers={
-            'Authorization': upload_data['authorizationToken'],
-            'X-Bz-File-Name': b2_path,
-            'Content-Type': content_type,
-            'Content-Length': str(len(file_data)),
-            'X-Bz-Content-Sha1': sha1
-        },
-        data=file_data
-    )
+    if r.status_code != 200:
+        raise Exception(f"B2 upload failed: {r.json()}")
+
+    print(f"Upload complete: {b2_path}")
     return f"{auth['download_url']}/file/{B2_BUCKET_NAME}/{b2_path}"
 
 
@@ -200,7 +212,7 @@ def process_video():
             output_path
         ], check=True)
 
-        # Upload final video to B2
+        # Upload final video to B2 (streaming)
         print("Uploading final video to B2")
         video_b2_path = f'exports/final_{job_id}.mp4'
         output_url = b2_upload_file(auth, bucket_id, output_path, video_b2_path, 'video/mp4')
