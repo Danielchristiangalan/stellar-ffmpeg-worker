@@ -17,6 +17,11 @@ B2_BUCKET_NAME = os.environ.get('B2_BUCKET_NAME')
 INTRO_B2_PATH = 'assets/intro.mp4'
 OUTRO_B2_PATH = 'assets/outro.mp4'
 
+# Intro duration: 4.12s, offset = 4.12 - 0.5 = 3.62
+# Outro duration: 4.0s,  offset = 4.0  - 0.5 = 3.5
+INTRO_XFADE_OFFSET = 3.62
+OUTRO_XFADE_OFFSET = 3.5
+
 
 def b2_authorize():
     r = requests.get(
@@ -157,14 +162,14 @@ def process_video():
             padded_path
         ], check=True)
 
-        # PASS 3 — Crossfade intro
+        # PASS 3 — Crossfade intro (intro duration 4.12s, offset 3.62)
         print("Pass 3: Adding intro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', intro_path,
             '-i', padded_path,
             '-filter_complex',
-            '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
+            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
@@ -172,14 +177,14 @@ def process_video():
             with_intro_path
         ], check=True)
 
-        # PASS 4 — Crossfade outro
+        # PASS 4 — Crossfade outro (outro duration 4.0s, offset 3.5)
         print("Pass 4: Adding outro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', with_intro_path,
             '-i', outro_path,
             '-filter_complex',
-            '[0:v][1:v]xfade=transition=fade:duration=0.5:offset=duration-0.5[vout];'
+            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
