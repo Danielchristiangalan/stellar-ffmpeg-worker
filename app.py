@@ -105,8 +105,8 @@ def process_video():
         bucket_id = B2_BUCKET_ID
 
        # Download raw video
-print(f"Downloading raw video from {raw_url}")
-r = requests.get(raw_url, headers={'Authorization': auth['token']}, stream=True)
+       print(f"Downloading raw video from {raw_url}")
+       r = requests.get(raw_url, headers={'Authorization': auth['token']}, stream=True)
         with open(raw_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
