@@ -2,9 +2,7 @@ import os
 import re
 import uuid
 import json
-import hashlib
 import subprocess
-import requests
 import boto3
 from botocore.config import Config
 from flask import Flask, request, jsonify
@@ -26,11 +24,11 @@ INTRO_DURATION = 4.12
 OUTRO_DURATION = 4.0
 FADE_DURATION = 0.5
 
-# Silence detection settings
-# -35dB catches real silence but ignores speech pauses
-# 1.5s minimum duration ignores brief pauses between words
+# Detect silence at -35dB, minimum 0.5s blocks
+# Only trim blocks longer than 2 seconds at start/end
 SILENCE_THRESHOLD_DB = -35
-SILENCE_MIN_DURATION = 1.5
+SILENCE_MIN_DURATION = 0.5
+SILENCE_TRIM_MIN = 2.0
 
 
 def get_r2_client():
@@ -108,19 +106,29 @@ def get_trim_points(path, duration):
     trim_start = 0.0
     trim_end = duration
 
-    # Only trim leading silence if it starts within first 5 seconds
-    if silence and silence[0][0] < 5.0:
-        trim_start = silence[0][1]
-        print(f"Trimming {trim_start:.2f}s of leading silence")
+    # Trim leading silence only if block is longer than SILENCE_TRIM_MIN seconds
+    # and starts within first 10 seconds
+    if silence and silence[0][0] < 10.0:
+        block_duration = silence[0][1] - silence[0][0]
+        if block_duration >= SILENCE_TRIM_MIN:
+            trim_start = silence[0][1]
+            print(f"Trimming {trim_start:.2f}s of leading silence (block: {block_duration:.2f}s)")
+        else:
+            print(f"Leading silence too short ({block_duration:.2f}s), skipping trim")
     else:
-        print("No leading silence detected, starting from 0")
+        print("No leading silence detected within first 10s")
 
-    # Only trim trailing silence if it ends within last 5 seconds
-    if silence and silence[-1][1] > duration - 5.0:
-        trim_end = silence[-1][0]
-        print(f"Trimming trailing silence, new end: {trim_end:.2f}s")
+    # Trim trailing silence only if block is longer than SILENCE_TRIM_MIN seconds
+    # and ends within last 10 seconds
+    if silence and silence[-1][1] > duration - 10.0:
+        block_duration = silence[-1][1] - silence[-1][0]
+        if block_duration >= SILENCE_TRIM_MIN:
+            trim_end = silence[-1][0]
+            print(f"Trimming trailing silence from {trim_end:.2f}s (block: {block_duration:.2f}s)")
+        else:
+            print(f"Trailing silence too short ({block_duration:.2f}s), skipping trim")
     else:
-        print("No trailing silence detected, keeping full end")
+        print("No trailing silence detected within last 10s")
 
     return trim_start, trim_end
 
