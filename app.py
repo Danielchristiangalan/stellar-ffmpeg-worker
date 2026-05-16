@@ -43,7 +43,6 @@ def b2_download_file(auth, bucket_name, b2_path, local_path):
 
 
 def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
-    # Get upload URL
     r = requests.post(
         f"{auth['api_url']}/b2api/v2/b2_get_upload_url",
         headers={'Authorization': auth['token']},
@@ -68,7 +67,6 @@ def b2_upload_file(auth, bucket_id, local_path, b2_path, content_type):
         },
         data=file_data
     )
-    result = r.json()
     return f"{auth['download_url']}/file/{B2_BUCKET_NAME}/{b2_path}"
 
 
@@ -104,9 +102,9 @@ def process_video():
         auth = b2_authorize()
         bucket_id = B2_BUCKET_ID
 
-       # Download raw video
-       print(f"Downloading raw video from {raw_url}")
-       r = requests.get(raw_url, headers={'Authorization': auth['token']}, stream=True)
+        # Download raw video with auth
+        print(f"Downloading raw video from {raw_url}")
+        r = requests.get(raw_url, headers={'Authorization': auth['token']}, stream=True)
         with open(raw_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -125,14 +123,12 @@ def process_video():
             trimmed_path
         ], check=True)
 
-        # PASS 1b — Apply cuts using copy (fast, no re-encode)
+        # PASS 1b — Apply cuts
         if cuts:
             print(f"Pass 1b: Applying {len(cuts)} cuts")
             select_expr = '+'.join([
                 f"between(t,{c['in']},{c['out']})" for c in cuts
             ])
-            # For cuts we must re-encode (copy can't do selective filtering)
-            # but we do it on the already-trimmed file which is smaller
             filter_complex = (
                 f"[0:v]select='not({select_expr})',setpts=N/FRAME_RATE/TB[v];"
                 f"[0:a]aselect='not({select_expr})',asetpts=N/SR/TB[a]"
