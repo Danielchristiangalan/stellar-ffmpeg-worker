@@ -149,27 +149,29 @@ def process_video():
         else:
             cut_path = trimmed_path
 
-        # PASS 2 — Pad to 1920x1080 with white background
+        # PASS 2 — Pad to 1920x1080 with white background, normalize to 30fps
         print("Pass 2: Padding to 1920x1080")
         subprocess.run([
             'ffmpeg', '-y', '-i', cut_path,
             '-vf', (
                 'scale=1720:968:force_original_aspect_ratio=decrease,'
-                'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white'
+                'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white,'
+                'fps=30'
             ),
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
             '-c:a', 'aac',
             padded_path
         ], check=True)
 
-        # PASS 3 — Crossfade intro (intro duration 4.12s, offset 3.62)
+        # PASS 3 — Crossfade intro (normalize both to 30fps before xfade)
         print("Pass 3: Adding intro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', intro_path,
             '-i', padded_path,
             '-filter_complex',
-            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
+            f'[0:v]fps=30[v0];[1:v]fps=30[v1];'
+            f'[v0][v1]xfade=transition=fade:duration=0.5:offset={INTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
@@ -177,14 +179,15 @@ def process_video():
             with_intro_path
         ], check=True)
 
-        # PASS 4 — Crossfade outro (outro duration 4.0s, offset 3.5)
+        # PASS 4 — Crossfade outro (normalize both to 30fps before xfade)
         print("Pass 4: Adding outro")
         subprocess.run([
             'ffmpeg', '-y',
             '-i', with_intro_path,
             '-i', outro_path,
             '-filter_complex',
-            f'[0:v][1:v]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
+            f'[0:v]fps=30[v0];[1:v]fps=30[v1];'
+            f'[v0][v1]xfade=transition=fade:duration=0.5:offset={OUTRO_XFADE_OFFSET}[vout];'
             '[0:a][1:a]acrossfade=d=0.5[aout]',
             '-map', '[vout]', '-map', '[aout]',
             '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
