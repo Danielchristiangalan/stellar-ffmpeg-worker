@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import threading
 import subprocess
 import boto3
 from botocore.config import Config
@@ -24,9 +25,10 @@ OUTRO_PATH = 'assets/outro.mp4'
 INTRO_DURATION = 4.12
 FADE_DURATION = 0.5
 WORD_MAX_DURATION = 3.0
-
-# Brand prefix for exported files
 EXPORT_PREFIX = 'Acumatica How To_'
+
+# In-memory job store
+jobs = {}
 
 
 def get_r2_client():
@@ -126,7 +128,6 @@ def find_speech_boundaries(words):
 
 
 def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id, work_dir):
-    """Core video processing pipeline."""
     raw_path = f'{work_dir}/raw.mp4'
     trimmed_path = f'{work_dir}/trimmed.mp4'
     cut_path = f'{work_dir}/cut.mp4'
@@ -150,7 +151,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     trim_duration = trim_end - trim_start
     print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
 
-    # Pre-process intro
     print("Pre-processing intro")
     intro_fade_start = INTRO_DURATION - FADE_DURATION
     subprocess.run([
@@ -162,7 +162,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         intro_path
     ], check=True)
 
-    # Pre-process outro
     print("Pre-processing outro")
     subprocess.run([
         'ffmpeg', '-y', '-i', outro_raw_path,
@@ -173,7 +172,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         outro_path
     ], check=True)
 
-    # PASS 1 — Trim
     print("Pass 1: Trimming to speech start/end")
     subprocess.run([
         'ffmpeg', '-y', '-i', raw_path,
@@ -184,7 +182,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         trimmed_path
     ], check=True)
 
-    # PASS 1b — Apply cuts
     if cuts:
         print(f"Pass 1b: Applying {len(cuts)} cuts")
         select_expr = '+'.join([
@@ -205,12 +202,9 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     else:
         cut_path = trimmed_path
 
-    # Get duration for fade out
     cut_duration = get_video_duration(cut_path)
     fade_out_start = max(0, cut_duration - FADE_DURATION)
-    print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
 
-    # PASS 2 — Pad to 1920x1080
     print("Pass 2: Padding to 1920x1080")
     subprocess.run([
         'ffmpeg', '-y', '-i', cut_path,
@@ -231,7 +225,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         padded_path
     ], check=True)
 
-    # PASS 3 — Concat
     print("Pass 3: Concatenating intro + main + outro")
     with open(concat_list_path, 'w') as f:
         f.write(f"file '{intro_path}'\n")
@@ -248,13 +241,11 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         output_path
     ], check=True)
 
-    # Build export filename from raw video name
     raw_filename = os.path.splitext(os.path.basename(raw_key))[0]
     video_key = f'exports/{EXPORT_PREFIX}{raw_filename}.mp4'
     print(f"Export filename: {video_key}")
     output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
 
-    # Upload transcript
     transcript_url = None
     if transcript:
         transcript_path = f'{work_dir}/transcript.txt'
@@ -266,30 +257,17 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     return output_url, transcript_url
 
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'})
-
-
-@app.route('/run', methods=['POST'])
-def run():
-    """Full pipeline: transcribe + process in one call."""
-    data = request.get_json()
-    raw_key = data.get('raw_key')
-    cuts = data.get('cuts', [])
-
-    if not raw_key:
-        return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
-
-    job_id = str(uuid.uuid4())
+def process_job(job_id, raw_key, cuts):
+    """Background thread that runs the full pipeline."""
     work_dir = f'/tmp/{job_id}'
     os.makedirs(work_dir, exist_ok=True)
 
     try:
+        jobs[job_id]['status'] = 'transcribing'
         r2 = get_r2_client()
 
         # Step 1 — Transcribe
-        print("=== STEP 1: TRANSCRIPTION ===")
+        print(f"[{job_id}] === STEP 1: TRANSCRIPTION ===")
         video_path = f'{work_dir}/raw_audio_source.mp4'
         audio_path = f'{work_dir}/audio.wav'
 
@@ -301,15 +279,16 @@ def run():
         words = result.get('words', [])
         speech_start, speech_end = find_speech_boundaries(words)
 
-        print(f"Transcript length: {len(transcript)} chars")
-        print(f"Speech: {speech_start:.2f}s to {speech_end:.2f}s")
-
-        # Clean up audio files to save disk space
         os.remove(video_path)
         os.remove(audio_path)
 
-        # Step 2 — Process video
-        print("=== STEP 2: VIDEO PROCESSING ===")
+        jobs[job_id]['status'] = 'processing'
+        jobs[job_id]['transcript'] = transcript
+        jobs[job_id]['speech_start'] = speech_start
+        jobs[job_id]['speech_end'] = speech_end
+
+        # Step 2 — Process
+        print(f"[{job_id}] === STEP 2: VIDEO PROCESSING ===")
         output_url, transcript_url = run_pipeline(
             r2, raw_key, cuts, transcript,
             speech_start, speech_end,
@@ -318,25 +297,65 @@ def run():
 
         subprocess.run(['rm', '-rf', work_dir])
 
-        return jsonify({
+        jobs[job_id].update({
             'status': 'complete',
             'output_url': output_url,
             'transcript_url': transcript_url,
-            'transcript': transcript,
-            'speech_start': speech_start,
-            'speech_end': speech_end,
-            'job_id': job_id
         })
+        print(f"[{job_id}] Job complete")
 
     except Exception as e:
         subprocess.run(['rm', '-rf', work_dir])
-        print(f"Pipeline error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        jobs[job_id].update({
+            'status': 'error',
+            'error': str(e)
+        })
+        print(f"[{job_id}] Job failed: {e}")
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/run', methods=['POST'])
+def run():
+    """Start pipeline job — returns immediately with job_id."""
+    data = request.get_json()
+    raw_key = data.get('raw_key')
+    cuts = data.get('cuts', [])
+
+    if not raw_key:
+        return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'queued',
+        'raw_key': raw_key,
+        'job_id': job_id
+    }
+
+    thread = threading.Thread(target=process_job, args=(job_id, raw_key, cuts))
+    thread.daemon = True
+    thread.start()
+
+    return jsonify({
+        'status': 'queued',
+        'job_id': job_id,
+        'message': f'Job started. Poll /status/{job_id} for updates.'
+    })
+
+
+@app.route('/status/<job_id>', methods=['GET'])
+def status(job_id):
+    """Poll job status."""
+    if job_id not in jobs:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+    return jsonify(jobs[job_id])
 
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_video():
-    """Transcribe only."""
     data = request.get_json()
     raw_key = data.get('raw_key')
 
@@ -372,13 +391,11 @@ def transcribe_video():
 
     except Exception as e:
         subprocess.run(['rm', '-rf', work_dir])
-        print(f"Transcription error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/process', methods=['POST'])
 def process_video():
-    """Process only — use when you already have transcript and speech timestamps."""
     data = request.get_json()
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
@@ -412,7 +429,6 @@ def process_video():
 
     except Exception as e:
         subprocess.run(['rm', '-rf', work_dir])
-        print(f"Pipeline error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
