@@ -3,11 +3,10 @@ import re
 import uuid
 import json
 import subprocess
-import tempfile
 import boto3
-import requests
 from botocore.config import Config
 from flask import Flask, request, jsonify
+import requests as http_requests
 
 # Install ffmpeg at runtime if not available
 os.system("apt-get update -qq && apt-get install -y ffmpeg -qq")
@@ -24,8 +23,10 @@ INTRO_PATH = 'assets/intro.mp4'
 OUTRO_PATH = 'assets/outro.mp4'
 
 INTRO_DURATION = 4.12
-OUTRO_DURATION = 4.0
 FADE_DURATION = 0.5
+
+# Max duration for a single spoken word — filters out Whisper hallucinations
+WORD_MAX_DURATION = 3.0
 
 
 def get_r2_client():
@@ -72,7 +73,6 @@ def get_video_duration(path):
 
 
 def extract_audio(video_path, audio_path):
-    """Extract mono 16kHz audio from video for Whisper."""
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
         '-vn',
@@ -85,10 +85,9 @@ def extract_audio(video_path, audio_path):
 
 
 def transcribe_with_groq(audio_path):
-    """Send audio to Groq Whisper and return transcript with timestamps."""
     print("Sending audio to Groq Whisper...")
     with open(audio_path, 'rb') as f:
-        response = requests.post(
+        response = http_requests.post(
             'https://api.groq.com/openai/v1/audio/transcriptions',
             headers={'Authorization': f'Bearer {GROQ_API_KEY}'},
             files={'file': ('audio.wav', f, 'audio/wav')},
@@ -114,15 +113,6 @@ def health():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_video():
-    """
-    Transcribe a video from R2 using Groq Whisper.
-    Returns transcript text, speech_start, and speech_end timestamps.
-
-    Request body:
-    {
-        "raw_key": "raw-intake/myvideo.mp4"
-    }
-    """
     data = request.get_json()
     raw_key = data.get('raw_key')
 
@@ -138,37 +128,38 @@ def transcribe_video():
 
     try:
         r2 = get_r2_client()
-
-        # Download video from R2
         r2_download_file(r2, raw_key, video_path)
-
-        # Extract audio
         extract_audio(video_path, audio_path)
-
-        # Transcribe with Groq Whisper
         result = transcribe_with_groq(audio_path)
 
-        # Get full transcript text
         transcript = result.get('text', '').strip()
-
-        # Get speech start from first word timestamp
         words = result.get('words', [])
+
         speech_start = None
         speech_end = None
 
         if words:
-            speech_start = words[0].get('start', 0.0)
-            speech_end = words[-1].get('end', None)
-            print(f"Speech start: {speech_start:.2f}s, Speech end: {speech_end:.2f}s")
-        else:
-            # Fall back to segment timestamps if no word timestamps
-            segments = result.get('segments', [])
-            if segments:
-                speech_start = segments[0].get('start', 0.0)
-                speech_end = segments[-1].get('end', None)
-                print(f"Segment-based speech start: {speech_start:.2f}s, end: {speech_end:.2f}s")
+            # Filter out words with abnormally long durations
+            # These are Whisper hallucinations from pre/post speech noise
+            valid_words = [
+                w for w in words
+                if (w.get('end', 0) - w.get('start', 0)) <= WORD_MAX_DURATION
+            ]
 
-        # Cleanup
+            if valid_words:
+                speech_start = valid_words[0].get('start', 0.0)
+                speech_end = valid_words[-1].get('end', None)
+                print(f"Speech start: {speech_start:.2f}s, Speech end: {speech_end:.2f}s")
+                print(f"First valid word: '{valid_words[0].get('word')}' at {speech_start:.2f}s")
+                print(f"Last valid word: '{valid_words[-1].get('word')}' at {speech_end:.2f}s")
+            else:
+                # Fall back to segments if all words filtered
+                segments = result.get('segments', [])
+                if segments:
+                    speech_start = segments[0].get('start', 0.0)
+                    speech_end = segments[-1].get('end', None)
+                    print(f"Fallback to segments: {speech_start:.2f}s to {speech_end:.2f}s")
+
         subprocess.run(['rm', '-rf', work_dir])
 
         return jsonify({
@@ -216,16 +207,14 @@ def process_video():
     try:
         r2 = get_r2_client()
 
-        # Download all files from R2
         print(f"Downloading raw video: {raw_key}")
         r2_download_file(r2, raw_key, raw_path)
         r2_download_file(r2, INTRO_PATH, intro_raw_path)
         r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
-        # Get raw video duration
         raw_duration = get_video_duration(raw_path)
 
-        # Determine trim points from speech timestamps
+        # Determine trim points
         if speech_start is not None:
             trim_start = float(speech_start)
             print(f"Using speech_start: {trim_start:.2f}s")
