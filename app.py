@@ -1,5 +1,4 @@
 import os
-import re
 import uuid
 import json
 import subprocess
@@ -25,8 +24,8 @@ OUTRO_PATH = 'assets/outro.mp4'
 INTRO_DURATION = 4.12
 FADE_DURATION = 0.5
 
-# Max duration for a single spoken word — filters out Whisper hallucinations
-WORD_MAX_DURATION = 3.0
+# Max gap between consecutive words to be considered continuous speech
+SPEECH_GAP_THRESHOLD = 2.0
 
 
 def get_r2_client():
@@ -75,9 +74,7 @@ def get_video_duration(path):
 def extract_audio(video_path, audio_path):
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
-        '-vn',
-        '-ar', '16000',
-        '-ac', '1',
+        '-vn', '-ar', '16000', '-ac', '1',
         '-c:a', 'pcm_s16le',
         audio_path
     ], check=True)
@@ -97,13 +94,44 @@ def transcribe_with_groq(audio_path):
                 'timestamp_granularities[]': 'word'
             }
         )
-
     if response.status_code != 200:
         raise Exception(f"Groq transcription failed: {response.text}")
-
-    result = response.json()
     print("Transcription complete")
-    return result
+    return response.json()
+
+
+def find_speech_boundaries(words):
+    """
+    Find where continuous speech starts and ends by looking at gaps between words.
+    A gap > SPEECH_GAP_THRESHOLD seconds between words means pre/post speech noise.
+    """
+    if not words:
+        return None, None
+
+    # Find speech start: first word that is followed closely by the next word
+    speech_start = words[0].get('start', 0.0)
+    for i in range(len(words) - 1):
+        curr_end = words[i].get('end', 0)
+        next_start = words[i + 1].get('start', 0)
+        gap = next_start - curr_end
+        if gap < SPEECH_GAP_THRESHOLD:
+            # This word is part of continuous speech
+            speech_start = words[i].get('start', 0.0)
+            print(f"Speech starts at word '{words[i].get('word')}' at {speech_start:.2f}s (gap to next: {gap:.2f}s)")
+            break
+
+    # Find speech end: last word that is preceded closely by the previous word
+    speech_end = words[-1].get('end', 0.0)
+    for i in range(len(words) - 1, 0, -1):
+        curr_start = words[i].get('start', 0)
+        prev_end = words[i - 1].get('end', 0)
+        gap = curr_start - prev_end
+        if gap < SPEECH_GAP_THRESHOLD:
+            speech_end = words[i].get('end', 0.0)
+            print(f"Speech ends at word '{words[i].get('word')}' at {speech_end:.2f}s (gap from prev: {gap:.2f}s)")
+            break
+
+    return speech_start, speech_end
 
 
 @app.route('/health', methods=['GET'])
@@ -135,30 +163,9 @@ def transcribe_video():
         transcript = result.get('text', '').strip()
         words = result.get('words', [])
 
-        speech_start = None
-        speech_end = None
+        speech_start, speech_end = find_speech_boundaries(words)
 
-        if words:
-            # Filter out words with abnormally long durations
-            # These are Whisper hallucinations from pre/post speech noise
-            valid_words = [
-                w for w in words
-                if (w.get('end', 0) - w.get('start', 0)) <= WORD_MAX_DURATION
-            ]
-
-            if valid_words:
-                speech_start = valid_words[0].get('start', 0.0)
-                speech_end = valid_words[-1].get('end', None)
-                print(f"Speech start: {speech_start:.2f}s, Speech end: {speech_end:.2f}s")
-                print(f"First valid word: '{valid_words[0].get('word')}' at {speech_start:.2f}s")
-                print(f"Last valid word: '{valid_words[-1].get('word')}' at {speech_end:.2f}s")
-            else:
-                # Fall back to segments if all words filtered
-                segments = result.get('segments', [])
-                if segments:
-                    speech_start = segments[0].get('start', 0.0)
-                    speech_end = segments[-1].get('end', None)
-                    print(f"Fallback to segments: {speech_start:.2f}s to {speech_end:.2f}s")
+        print(f"Final speech boundaries: {speech_start:.2f}s to {speech_end:.2f}s")
 
         subprocess.run(['rm', '-rf', work_dir])
 
@@ -167,7 +174,6 @@ def transcribe_video():
             'transcript': transcript,
             'speech_start': speech_start,
             'speech_end': speech_end,
-            'words': words,
             'raw_key': raw_key
         })
 
@@ -214,7 +220,6 @@ def process_video():
 
         raw_duration = get_video_duration(raw_path)
 
-        # Determine trim points
         if speech_start is not None:
             trim_start = float(speech_start)
             print(f"Using speech_start: {trim_start:.2f}s")
