@@ -24,8 +24,8 @@ OUTRO_PATH = 'assets/outro.mp4'
 INTRO_DURATION = 4.12
 FADE_DURATION = 0.5
 
-# Max gap between consecutive words to be considered continuous speech
-SPEECH_GAP_THRESHOLD = 2.0
+# Max duration for a single spoken word
+WORD_MAX_DURATION = 3.0
 
 
 def get_r2_client():
@@ -102,34 +102,32 @@ def transcribe_with_groq(audio_path):
 
 def find_speech_boundaries(words):
     """
-    Find where continuous speech starts and ends by looking at gaps between words.
-    A gap > SPEECH_GAP_THRESHOLD seconds between words means pre/post speech noise.
+    Find where real speech starts and ends.
+    Filters out words with abnormally long durations (Whisper hallucinations
+    from pre/post speech noise like shuffling, breathing, clicks).
+    A real spoken word is never longer than WORD_MAX_DURATION seconds.
     """
     if not words:
         return None, None
 
-    # Find speech start: first word that is followed closely by the next word
-    speech_start = words[0].get('start', 0.0)
-    for i in range(len(words) - 1):
-        curr_end = words[i].get('end', 0)
-        next_start = words[i + 1].get('start', 0)
-        gap = next_start - curr_end
-        if gap < SPEECH_GAP_THRESHOLD:
-            # This word is part of continuous speech
-            speech_start = words[i].get('start', 0.0)
-            print(f"Speech starts at word '{words[i].get('word')}' at {speech_start:.2f}s (gap to next: {gap:.2f}s)")
-            break
+    # Filter to only normally-spoken words
+    normal_words = [
+        w for w in words
+        if (w.get('end', 0) - w.get('start', 0)) <= WORD_MAX_DURATION
+    ]
 
-    # Find speech end: last word that is preceded closely by the previous word
-    speech_end = words[-1].get('end', 0.0)
-    for i in range(len(words) - 1, 0, -1):
-        curr_start = words[i].get('start', 0)
-        prev_end = words[i - 1].get('end', 0)
-        gap = curr_start - prev_end
-        if gap < SPEECH_GAP_THRESHOLD:
-            speech_end = words[i].get('end', 0.0)
-            print(f"Speech ends at word '{words[i].get('word')}' at {speech_end:.2f}s (gap from prev: {gap:.2f}s)")
-            break
+    print(f"Total words: {len(words)}, Normal words: {len(normal_words)}")
+
+    if not normal_words:
+        # Fallback if everything filtered out
+        return words[0].get('start', 0.0), words[-1].get('end', 0.0)
+
+    speech_start = normal_words[0].get('start', 0.0)
+    speech_end = normal_words[-1].get('end', 0.0)
+
+    print(f"First normal word: '{normal_words[0].get('word')}' at {speech_start:.2f}s")
+    print(f"Last normal word: '{normal_words[-1].get('word')}' at {speech_end:.2f}s")
+    print(f"Speech boundaries: {speech_start:.2f}s to {speech_end:.2f}s")
 
     return speech_start, speech_end
 
@@ -164,8 +162,6 @@ def transcribe_video():
         words = result.get('words', [])
 
         speech_start, speech_end = find_speech_boundaries(words)
-
-        print(f"Final speech boundaries: {speech_start:.2f}s to {speech_end:.2f}s")
 
         subprocess.run(['rm', '-rf', work_dir])
 
