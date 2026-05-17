@@ -3,7 +3,9 @@ import re
 import uuid
 import json
 import subprocess
+import tempfile
 import boto3
+import requests
 from botocore.config import Config
 from flask import Flask, request, jsonify
 
@@ -16,6 +18,7 @@ R2_ACCESS_KEY_ID = os.environ.get('R2_ACCESS_KEY_ID')
 R2_SECRET_ACCESS_KEY = os.environ.get('R2_SECRET_ACCESS_KEY')
 R2_ACCOUNT_ID = os.environ.get('R2_ACCOUNT_ID')
 R2_BUCKET_NAME = os.environ.get('R2_BUCKET_NAME')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 
 INTRO_PATH = 'assets/intro.mp4'
 OUTRO_PATH = 'assets/outro.mp4'
@@ -68,9 +71,119 @@ def get_video_duration(path):
     return duration
 
 
+def extract_audio(video_path, audio_path):
+    """Extract mono 16kHz audio from video for Whisper."""
+    subprocess.run([
+        'ffmpeg', '-y', '-i', video_path,
+        '-vn',
+        '-ar', '16000',
+        '-ac', '1',
+        '-c:a', 'pcm_s16le',
+        audio_path
+    ], check=True)
+    print(f"Audio extracted to {audio_path}")
+
+
+def transcribe_with_groq(audio_path):
+    """Send audio to Groq Whisper and return transcript with timestamps."""
+    print("Sending audio to Groq Whisper...")
+    with open(audio_path, 'rb') as f:
+        response = requests.post(
+            'https://api.groq.com/openai/v1/audio/transcriptions',
+            headers={'Authorization': f'Bearer {GROQ_API_KEY}'},
+            files={'file': ('audio.wav', f, 'audio/wav')},
+            data={
+                'model': 'whisper-large-v3',
+                'response_format': 'verbose_json',
+                'timestamp_granularities[]': 'word'
+            }
+        )
+
+    if response.status_code != 200:
+        raise Exception(f"Groq transcription failed: {response.text}")
+
+    result = response.json()
+    print("Transcription complete")
+    return result
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
+
+@app.route('/transcribe', methods=['POST'])
+def transcribe_video():
+    """
+    Transcribe a video from R2 using Groq Whisper.
+    Returns transcript text, speech_start, and speech_end timestamps.
+
+    Request body:
+    {
+        "raw_key": "raw-intake/myvideo.mp4"
+    }
+    """
+    data = request.get_json()
+    raw_key = data.get('raw_key')
+
+    if not raw_key:
+        return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
+
+    job_id = str(uuid.uuid4())
+    work_dir = f'/tmp/transcribe_{job_id}'
+    os.makedirs(work_dir, exist_ok=True)
+
+    video_path = f'{work_dir}/raw.mp4'
+    audio_path = f'{work_dir}/audio.wav'
+
+    try:
+        r2 = get_r2_client()
+
+        # Download video from R2
+        r2_download_file(r2, raw_key, video_path)
+
+        # Extract audio
+        extract_audio(video_path, audio_path)
+
+        # Transcribe with Groq Whisper
+        result = transcribe_with_groq(audio_path)
+
+        # Get full transcript text
+        transcript = result.get('text', '').strip()
+
+        # Get speech start from first word timestamp
+        words = result.get('words', [])
+        speech_start = None
+        speech_end = None
+
+        if words:
+            speech_start = words[0].get('start', 0.0)
+            speech_end = words[-1].get('end', None)
+            print(f"Speech start: {speech_start:.2f}s, Speech end: {speech_end:.2f}s")
+        else:
+            # Fall back to segment timestamps if no word timestamps
+            segments = result.get('segments', [])
+            if segments:
+                speech_start = segments[0].get('start', 0.0)
+                speech_end = segments[-1].get('end', None)
+                print(f"Segment-based speech start: {speech_start:.2f}s, end: {speech_end:.2f}s")
+
+        # Cleanup
+        subprocess.run(['rm', '-rf', work_dir])
+
+        return jsonify({
+            'status': 'complete',
+            'transcript': transcript,
+            'speech_start': speech_start,
+            'speech_end': speech_end,
+            'words': words,
+            'raw_key': raw_key
+        })
+
+    except Exception as e:
+        subprocess.run(['rm', '-rf', work_dir])
+        print(f"Transcription error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/process', methods=['POST'])
@@ -79,8 +192,8 @@ def process_video():
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
     transcript = data.get('transcript', '')
-    speech_start = data.get('speech_start', None)  # seconds, from Whisper
-    speech_end = data.get('speech_end', None)       # seconds, from Whisper
+    speech_start = data.get('speech_start', None)
+    speech_end = data.get('speech_end', None)
 
     if not raw_key:
         return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
@@ -112,19 +225,17 @@ def process_video():
         # Get raw video duration
         raw_duration = get_video_duration(raw_path)
 
-        # Determine trim points
-        # Use speech_start/speech_end from Whisper if provided
-        # Otherwise fall back to full video
+        # Determine trim points from speech timestamps
         if speech_start is not None:
             trim_start = float(speech_start)
-            print(f"Using Whisper speech_start: {trim_start:.2f}s")
+            print(f"Using speech_start: {trim_start:.2f}s")
         else:
             trim_start = 0.0
             print("No speech_start provided, starting from 0")
 
         if speech_end is not None:
             trim_end = float(speech_end)
-            print(f"Using Whisper speech_end: {trim_end:.2f}s")
+            print(f"Using speech_end: {trim_end:.2f}s")
         else:
             trim_end = raw_duration
             print("No speech_end provided, using full duration")
@@ -132,7 +243,7 @@ def process_video():
         trim_duration = trim_end - trim_start
         print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
 
-        # Pre-process intro: normalize to 30fps, mono, 1920x1080, fade out
+        # Pre-process intro
         print("Pre-processing intro")
         intro_fade_start = INTRO_DURATION - FADE_DURATION
         subprocess.run([
@@ -144,7 +255,7 @@ def process_video():
             intro_path
         ], check=True)
 
-        # Pre-process outro: normalize to 30fps, mono, 1920x1080, fade in
+        # Pre-process outro
         print("Pre-processing outro")
         subprocess.run([
             'ffmpeg', '-y', '-i', outro_raw_path,
@@ -155,7 +266,7 @@ def process_video():
             outro_path
         ], check=True)
 
-        # PASS 1 — Trim to speech points, re-encode for audio sync
+        # PASS 1 — Trim to speech points
         print("Pass 1: Trimming to speech start/end")
         subprocess.run([
             'ffmpeg', '-y', '-i', raw_path,
@@ -187,12 +298,12 @@ def process_video():
         else:
             cut_path = trimmed_path
 
-        # Get duration of cut video for fade out timing
+        # Get duration for fade out timing
         cut_duration = get_video_duration(cut_path)
         fade_out_start = max(0, cut_duration - FADE_DURATION)
         print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
 
-        # PASS 2 — Pad to 1920x1080, normalize to 30fps mono, fade in/out
+        # PASS 2 — Pad to 1920x1080
         print("Pass 2: Padding to 1920x1080")
         subprocess.run([
             'ffmpeg', '-y', '-i', cut_path,
@@ -230,12 +341,11 @@ def process_video():
             output_path
         ], check=True)
 
-        # Upload final video to R2
+        # Upload to R2
         print("Uploading final video to R2")
         video_key = f'exports/final_{job_id}.mp4'
         output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
 
-        # Upload transcript if provided
         transcript_url = None
         if transcript:
             transcript_path = f'{work_dir}/transcript.txt'
@@ -244,7 +354,6 @@ def process_video():
             transcript_key = f'exports/transcript_{job_id}.txt'
             transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
 
-        # Cleanup
         subprocess.run(['rm', '-rf', work_dir])
 
         return jsonify({
