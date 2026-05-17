@@ -24,12 +24,6 @@ INTRO_DURATION = 4.12
 OUTRO_DURATION = 4.0
 FADE_DURATION = 0.5
 
-# Detect silence at -35dB, minimum 0.5s blocks
-# Only trim blocks longer than 2 seconds at start/end
-SILENCE_THRESHOLD_DB = -35
-SILENCE_MIN_DURATION = 0.5
-SILENCE_TRIM_MIN = 2.0
-
 
 def get_r2_client():
     return boto3.client(
@@ -74,65 +68,6 @@ def get_video_duration(path):
     return duration
 
 
-def detect_silence(path):
-    result = subprocess.run([
-        'ffmpeg', '-i', path,
-        '-af', f'silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={SILENCE_MIN_DURATION}',
-        '-f', 'null', '-'
-    ], capture_output=True, text=True)
-
-    silence_periods = []
-    silence_start = None
-
-    for line in result.stderr.split('\n'):
-        if 'silence_start' in line:
-            match = re.search(r'silence_start: ([\d.]+)', line)
-            if match:
-                silence_start = float(match.group(1))
-        if 'silence_end' in line and silence_start is not None:
-            match = re.search(r'silence_end: ([\d.]+)', line)
-            if match:
-                silence_end = float(match.group(1))
-                silence_periods.append((silence_start, silence_end))
-                silence_start = None
-
-    print(f"Detected silence periods: {silence_periods}")
-    return silence_periods
-
-
-def get_trim_points(path, duration):
-    silence = detect_silence(path)
-
-    trim_start = 0.0
-    trim_end = duration
-
-    # Trim leading silence only if block is longer than SILENCE_TRIM_MIN seconds
-    # and starts within first 10 seconds
-    if silence and silence[0][0] < 10.0:
-        block_duration = silence[0][1] - silence[0][0]
-        if block_duration >= SILENCE_TRIM_MIN:
-            trim_start = silence[0][1]
-            print(f"Trimming {trim_start:.2f}s of leading silence (block: {block_duration:.2f}s)")
-        else:
-            print(f"Leading silence too short ({block_duration:.2f}s), skipping trim")
-    else:
-        print("No leading silence detected within first 10s")
-
-    # Trim trailing silence only if block is longer than SILENCE_TRIM_MIN seconds
-    # and ends within last 10 seconds
-    if silence and silence[-1][1] > duration - 10.0:
-        block_duration = silence[-1][1] - silence[-1][0]
-        if block_duration >= SILENCE_TRIM_MIN:
-            trim_end = silence[-1][0]
-            print(f"Trimming trailing silence from {trim_end:.2f}s (block: {block_duration:.2f}s)")
-        else:
-            print(f"Trailing silence too short ({block_duration:.2f}s), skipping trim")
-    else:
-        print("No trailing silence detected within last 10s")
-
-    return trim_start, trim_end
-
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
@@ -144,6 +79,8 @@ def process_video():
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
     transcript = data.get('transcript', '')
+    speech_start = data.get('speech_start', None)  # seconds, from Whisper
+    speech_end = data.get('speech_end', None)       # seconds, from Whisper
 
     if not raw_key:
         return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
@@ -172,6 +109,29 @@ def process_video():
         r2_download_file(r2, INTRO_PATH, intro_raw_path)
         r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
+        # Get raw video duration
+        raw_duration = get_video_duration(raw_path)
+
+        # Determine trim points
+        # Use speech_start/speech_end from Whisper if provided
+        # Otherwise fall back to full video
+        if speech_start is not None:
+            trim_start = float(speech_start)
+            print(f"Using Whisper speech_start: {trim_start:.2f}s")
+        else:
+            trim_start = 0.0
+            print("No speech_start provided, starting from 0")
+
+        if speech_end is not None:
+            trim_end = float(speech_end)
+            print(f"Using Whisper speech_end: {trim_end:.2f}s")
+        else:
+            trim_end = raw_duration
+            print("No speech_end provided, using full duration")
+
+        trim_duration = trim_end - trim_start
+        print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
+
         # Pre-process intro: normalize to 30fps, mono, 1920x1080, fade out
         print("Pre-processing intro")
         intro_fade_start = INTRO_DURATION - FADE_DURATION
@@ -195,15 +155,8 @@ def process_video():
             outro_path
         ], check=True)
 
-        # Auto-detect silence and get trim points
-        print("Detecting silence for auto-trim")
-        raw_duration = get_video_duration(raw_path)
-        trim_start, trim_end = get_trim_points(raw_path, raw_duration)
-        trim_duration = trim_end - trim_start
-        print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
-
-        # PASS 1 — Trim silence, re-encode to fix audio sync
-        print("Pass 1: Trimming silence")
+        # PASS 1 — Trim to speech points, re-encode for audio sync
+        print("Pass 1: Trimming to speech start/end")
         subprocess.run([
             'ffmpeg', '-y', '-i', raw_path,
             '-ss', str(trim_start),
@@ -239,7 +192,7 @@ def process_video():
         fade_out_start = max(0, cut_duration - FADE_DURATION)
         print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
 
-        # PASS 2 — Pad to 1920x1080, normalize to 30fps mono, auto fade in/out
+        # PASS 2 — Pad to 1920x1080, normalize to 30fps mono, fade in/out
         print("Pass 2: Padding to 1920x1080")
         subprocess.run([
             'ffmpeg', '-y', '-i', cut_path,
