@@ -23,8 +23,6 @@ OUTRO_PATH = 'assets/outro.mp4'
 
 INTRO_DURATION = 4.12
 FADE_DURATION = 0.5
-
-# Max duration for a single spoken word
 WORD_MAX_DURATION = 3.0
 
 
@@ -101,16 +99,9 @@ def transcribe_with_groq(audio_path):
 
 
 def find_speech_boundaries(words):
-    """
-    Find where real speech starts and ends.
-    Filters out words with abnormally long durations (Whisper hallucinations
-    from pre/post speech noise like shuffling, breathing, clicks).
-    A real spoken word is never longer than WORD_MAX_DURATION seconds.
-    """
     if not words:
         return None, None
 
-    # Filter to only normally-spoken words
     normal_words = [
         w for w in words
         if (w.get('end', 0) - w.get('start', 0)) <= WORD_MAX_DURATION
@@ -119,7 +110,6 @@ def find_speech_boundaries(words):
     print(f"Total words: {len(words)}, Normal words: {len(normal_words)}")
 
     if not normal_words:
-        # Fallback if everything filtered out
         return words[0].get('start', 0.0), words[-1].get('end', 0.0)
 
     speech_start = normal_words[0].get('start', 0.0)
@@ -132,13 +122,220 @@ def find_speech_boundaries(words):
     return speech_start, speech_end
 
 
+def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id, work_dir):
+    """Core video processing pipeline."""
+    raw_path = f'{work_dir}/raw.mp4'
+    trimmed_path = f'{work_dir}/trimmed.mp4'
+    cut_path = f'{work_dir}/cut.mp4'
+    padded_path = f'{work_dir}/padded.mp4'
+    intro_raw_path = f'{work_dir}/intro_raw.mp4'
+    outro_raw_path = f'{work_dir}/outro_raw.mp4'
+    intro_path = f'{work_dir}/intro.mp4'
+    outro_path = f'{work_dir}/outro.mp4'
+    concat_list_path = f'{work_dir}/concat.txt'
+    output_path = f'{work_dir}/final.mp4'
+
+    print(f"Downloading raw video: {raw_key}")
+    r2_download_file(r2, raw_key, raw_path)
+    r2_download_file(r2, INTRO_PATH, intro_raw_path)
+    r2_download_file(r2, OUTRO_PATH, outro_raw_path)
+
+    raw_duration = get_video_duration(raw_path)
+
+    trim_start = float(speech_start) if speech_start is not None else 0.0
+    trim_end = float(speech_end) if speech_end is not None else raw_duration
+    trim_duration = trim_end - trim_start
+    print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
+
+    # Pre-process intro
+    print("Pre-processing intro")
+    intro_fade_start = INTRO_DURATION - FADE_DURATION
+    subprocess.run([
+        'ffmpeg', '-y', '-i', intro_raw_path,
+        '-vf', f'fps=30,scale=1920:1080,fade=t=out:st={intro_fade_start}:d={FADE_DURATION}',
+        '-af', f'aformat=channel_layouts=mono,afade=t=out:st={intro_fade_start}:d={FADE_DURATION}',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        intro_path
+    ], check=True)
+
+    # Pre-process outro
+    print("Pre-processing outro")
+    subprocess.run([
+        'ffmpeg', '-y', '-i', outro_raw_path,
+        '-vf', f'fps=30,scale=1920:1080,fade=t=in:st=0:d={FADE_DURATION}',
+        '-af', f'aformat=channel_layouts=mono,afade=t=in:st=0:d={FADE_DURATION}',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        outro_path
+    ], check=True)
+
+    # PASS 1 — Trim
+    print("Pass 1: Trimming to speech start/end")
+    subprocess.run([
+        'ffmpeg', '-y', '-i', raw_path,
+        '-ss', str(trim_start),
+        '-t', str(trim_duration),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        trimmed_path
+    ], check=True)
+
+    # PASS 1b — Apply cuts
+    if cuts:
+        print(f"Pass 1b: Applying {len(cuts)} cuts")
+        select_expr = '+'.join([
+            f"between(t,{c['in']},{c['out']})" for c in cuts
+        ])
+        filter_complex = (
+            f"[0:v]select='not({select_expr})',setpts=N/FRAME_RATE/TB[v];"
+            f"[0:a]aselect='not({select_expr})',asetpts=N/SR/TB[a]"
+        )
+        subprocess.run([
+            'ffmpeg', '-y', '-i', trimmed_path,
+            '-filter_complex', filter_complex,
+            '-map', '[v]', '-map', '[a]',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
+            cut_path
+        ], check=True)
+    else:
+        cut_path = trimmed_path
+
+    # Get duration for fade out
+    cut_duration = get_video_duration(cut_path)
+    fade_out_start = max(0, cut_duration - FADE_DURATION)
+    print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
+
+    # PASS 2 — Pad to 1920x1080
+    print("Pass 2: Padding to 1920x1080")
+    subprocess.run([
+        'ffmpeg', '-y', '-i', cut_path,
+        '-vf', (
+            f'scale=1720:968:force_original_aspect_ratio=decrease,'
+            f'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white,'
+            f'fps=30,'
+            f'fade=t=in:st=0:d={FADE_DURATION},'
+            f'fade=t=out:st={fade_out_start}:d={FADE_DURATION}'
+        ),
+        '-af', (
+            f'aformat=channel_layouts=mono,'
+            f'afade=t=in:st=0:d={FADE_DURATION},'
+            f'afade=t=out:st={fade_out_start}:d={FADE_DURATION}'
+        ),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        padded_path
+    ], check=True)
+
+    # PASS 3 — Concat
+    print("Pass 3: Concatenating intro + main + outro")
+    with open(concat_list_path, 'w') as f:
+        f.write(f"file '{intro_path}'\n")
+        f.write(f"file '{padded_path}'\n")
+        f.write(f"file '{outro_path}'\n")
+
+    subprocess.run([
+        'ffmpeg', '-y',
+        '-f', 'concat', '-safe', '0',
+        '-i', concat_list_path,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        '-vsync', 'cfr', '-async', '1',
+        output_path
+    ], check=True)
+
+    # Upload video
+    print("Uploading final video to R2")
+    video_key = f'exports/final_{job_id}.mp4'
+    output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
+
+    # Upload transcript
+    transcript_url = None
+    if transcript:
+        transcript_path = f'{work_dir}/transcript.txt'
+        with open(transcript_path, 'w') as f:
+            f.write(transcript)
+        transcript_key = f'exports/transcript_{job_id}.txt'
+        transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
+
+    return output_url, transcript_url
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/run', methods=['POST'])
+def run():
+    """
+    Full pipeline: transcribe + process in one call.
+    Request body: { "raw_key": "raw-intake/myvideo.mp4", "cuts": [] }
+    """
+    data = request.get_json()
+    raw_key = data.get('raw_key')
+    cuts = data.get('cuts', [])
+
+    if not raw_key:
+        return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
+
+    job_id = str(uuid.uuid4())
+    work_dir = f'/tmp/{job_id}'
+    os.makedirs(work_dir, exist_ok=True)
+
+    try:
+        r2 = get_r2_client()
+
+        # Step 1 — Transcribe
+        print("=== STEP 1: TRANSCRIPTION ===")
+        video_path = f'{work_dir}/raw_audio_source.mp4'
+        audio_path = f'{work_dir}/audio.wav'
+
+        r2_download_file(r2, raw_key, video_path)
+        extract_audio(video_path, audio_path)
+        result = transcribe_with_groq(audio_path)
+
+        transcript = result.get('text', '').strip()
+        words = result.get('words', [])
+        speech_start, speech_end = find_speech_boundaries(words)
+
+        print(f"Transcript length: {len(transcript)} chars")
+        print(f"Speech: {speech_start:.2f}s to {speech_end:.2f}s")
+
+        # Clean up audio files to save disk space
+        os.remove(video_path)
+        os.remove(audio_path)
+
+        # Step 2 — Process video
+        print("=== STEP 2: VIDEO PROCESSING ===")
+        output_url, transcript_url = run_pipeline(
+            r2, raw_key, cuts, transcript,
+            speech_start, speech_end,
+            job_id, work_dir
+        )
+
+        subprocess.run(['rm', '-rf', work_dir])
+
+        return jsonify({
+            'status': 'complete',
+            'output_url': output_url,
+            'transcript_url': transcript_url,
+            'transcript': transcript,
+            'speech_start': speech_start,
+            'speech_end': speech_end,
+            'job_id': job_id
+        })
+
+    except Exception as e:
+        subprocess.run(['rm', '-rf', work_dir])
+        print(f"Pipeline error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/transcribe', methods=['POST'])
 def transcribe_video():
+    """Transcribe only — returns transcript and speech timestamps."""
     data = request.get_json()
     raw_key = data.get('raw_key')
 
@@ -160,7 +357,6 @@ def transcribe_video():
 
         transcript = result.get('text', '').strip()
         words = result.get('words', [])
-
         speech_start, speech_end = find_speech_boundaries(words)
 
         subprocess.run(['rm', '-rf', work_dir])
@@ -181,6 +377,7 @@ def transcribe_video():
 
 @app.route('/process', methods=['POST'])
 def process_video():
+    """Process only — use when you already have transcript and speech timestamps."""
     data = request.get_json()
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
@@ -195,154 +392,13 @@ def process_video():
     work_dir = f'/tmp/{job_id}'
     os.makedirs(work_dir, exist_ok=True)
 
-    raw_path = f'{work_dir}/raw.mp4'
-    trimmed_path = f'{work_dir}/trimmed.mp4'
-    cut_path = f'{work_dir}/cut.mp4'
-    padded_path = f'{work_dir}/padded.mp4'
-    intro_raw_path = f'{work_dir}/intro_raw.mp4'
-    outro_raw_path = f'{work_dir}/outro_raw.mp4'
-    intro_path = f'{work_dir}/intro.mp4'
-    outro_path = f'{work_dir}/outro.mp4'
-    concat_list_path = f'{work_dir}/concat.txt'
-    output_path = f'{work_dir}/final.mp4'
-
     try:
         r2 = get_r2_client()
-
-        print(f"Downloading raw video: {raw_key}")
-        r2_download_file(r2, raw_key, raw_path)
-        r2_download_file(r2, INTRO_PATH, intro_raw_path)
-        r2_download_file(r2, OUTRO_PATH, outro_raw_path)
-
-        raw_duration = get_video_duration(raw_path)
-
-        if speech_start is not None:
-            trim_start = float(speech_start)
-            print(f"Using speech_start: {trim_start:.2f}s")
-        else:
-            trim_start = 0.0
-            print("No speech_start provided, starting from 0")
-
-        if speech_end is not None:
-            trim_end = float(speech_end)
-            print(f"Using speech_end: {trim_end:.2f}s")
-        else:
-            trim_end = raw_duration
-            print("No speech_end provided, using full duration")
-
-        trim_duration = trim_end - trim_start
-        print(f"Trim: {trim_start:.2f}s to {trim_end:.2f}s (duration: {trim_duration:.2f}s)")
-
-        # Pre-process intro
-        print("Pre-processing intro")
-        intro_fade_start = INTRO_DURATION - FADE_DURATION
-        subprocess.run([
-            'ffmpeg', '-y', '-i', intro_raw_path,
-            '-vf', f'fps=30,scale=1920:1080,fade=t=out:st={intro_fade_start}:d={FADE_DURATION}',
-            '-af', f'aformat=channel_layouts=mono,afade=t=out:st={intro_fade_start}:d={FADE_DURATION}',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            intro_path
-        ], check=True)
-
-        # Pre-process outro
-        print("Pre-processing outro")
-        subprocess.run([
-            'ffmpeg', '-y', '-i', outro_raw_path,
-            '-vf', f'fps=30,scale=1920:1080,fade=t=in:st=0:d={FADE_DURATION}',
-            '-af', f'aformat=channel_layouts=mono,afade=t=in:st=0:d={FADE_DURATION}',
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            outro_path
-        ], check=True)
-
-        # PASS 1 — Trim to speech points
-        print("Pass 1: Trimming to speech start/end")
-        subprocess.run([
-            'ffmpeg', '-y', '-i', raw_path,
-            '-ss', str(trim_start),
-            '-t', str(trim_duration),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            trimmed_path
-        ], check=True)
-
-        # PASS 1b — Apply cuts
-        if cuts:
-            print(f"Pass 1b: Applying {len(cuts)} cuts")
-            select_expr = '+'.join([
-                f"between(t,{c['in']},{c['out']})" for c in cuts
-            ])
-            filter_complex = (
-                f"[0:v]select='not({select_expr})',setpts=N/FRAME_RATE/TB[v];"
-                f"[0:a]aselect='not({select_expr})',asetpts=N/SR/TB[a]"
-            )
-            subprocess.run([
-                'ffmpeg', '-y', '-i', trimmed_path,
-                '-filter_complex', filter_complex,
-                '-map', '[v]', '-map', '[a]',
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-                '-c:a', 'aac', '-ar', '48000',
-                cut_path
-            ], check=True)
-        else:
-            cut_path = trimmed_path
-
-        # Get duration for fade out timing
-        cut_duration = get_video_duration(cut_path)
-        fade_out_start = max(0, cut_duration - FADE_DURATION)
-        print(f"Cut video duration: {cut_duration:.2f}s, fade out at: {fade_out_start:.2f}s")
-
-        # PASS 2 — Pad to 1920x1080
-        print("Pass 2: Padding to 1920x1080")
-        subprocess.run([
-            'ffmpeg', '-y', '-i', cut_path,
-            '-vf', (
-                f'scale=1720:968:force_original_aspect_ratio=decrease,'
-                f'pad=1920:1080:(ow-iw)/2:(oh-ih)/2:white,'
-                f'fps=30,'
-                f'fade=t=in:st=0:d={FADE_DURATION},'
-                f'fade=t=out:st={fade_out_start}:d={FADE_DURATION}'
-            ),
-            '-af', (
-                f'aformat=channel_layouts=mono,'
-                f'afade=t=in:st=0:d={FADE_DURATION},'
-                f'afade=t=out:st={fade_out_start}:d={FADE_DURATION}'
-            ),
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            padded_path
-        ], check=True)
-
-        # PASS 3 — Concat intro + main + outro
-        print("Pass 3: Concatenating intro + main + outro")
-        with open(concat_list_path, 'w') as f:
-            f.write(f"file '{intro_path}'\n")
-            f.write(f"file '{padded_path}'\n")
-            f.write(f"file '{outro_path}'\n")
-
-        subprocess.run([
-            'ffmpeg', '-y',
-            '-f', 'concat', '-safe', '0',
-            '-i', concat_list_path,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            '-vsync', 'cfr', '-async', '1',
-            output_path
-        ], check=True)
-
-        # Upload to R2
-        print("Uploading final video to R2")
-        video_key = f'exports/final_{job_id}.mp4'
-        output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
-
-        transcript_url = None
-        if transcript:
-            transcript_path = f'{work_dir}/transcript.txt'
-            with open(transcript_path, 'w') as f:
-                f.write(transcript)
-            transcript_key = f'exports/transcript_{job_id}.txt'
-            transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
+        output_url, transcript_url = run_pipeline(
+            r2, raw_key, cuts, transcript,
+            speech_start, speech_end,
+            job_id, work_dir
+        )
 
         subprocess.run(['rm', '-rf', work_dir])
 
