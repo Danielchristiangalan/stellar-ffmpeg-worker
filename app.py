@@ -25,6 +25,9 @@ INTRO_DURATION = 4.12
 FADE_DURATION = 0.5
 WORD_MAX_DURATION = 3.0
 
+# Brand prefix for exported files
+EXPORT_PREFIX = 'Acumatica How To_'
+
 
 def get_r2_client():
     return boto3.client(
@@ -245,9 +248,10 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         output_path
     ], check=True)
 
-    # Upload video
-    print("Uploading final video to R2")
-    video_key = f'exports/final_{job_id}.mp4'
+    # Build export filename from raw video name
+    raw_filename = os.path.splitext(os.path.basename(raw_key))[0]
+    video_key = f'exports/{EXPORT_PREFIX}{raw_filename}.mp4'
+    print(f"Export filename: {video_key}")
     output_url = r2_upload_file(r2, output_path, video_key, 'video/mp4')
 
     # Upload transcript
@@ -256,7 +260,7 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         transcript_path = f'{work_dir}/transcript.txt'
         with open(transcript_path, 'w') as f:
             f.write(transcript)
-        transcript_key = f'exports/transcript_{job_id}.txt'
+        transcript_key = f'exports/{EXPORT_PREFIX}{raw_filename}.txt'
         transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
 
     return output_url, transcript_url
@@ -269,10 +273,7 @@ def health():
 
 @app.route('/run', methods=['POST'])
 def run():
-    """
-    Full pipeline: transcribe + process in one call.
-    Request body: { "raw_key": "raw-intake/myvideo.mp4", "cuts": [] }
-    """
+    """Full pipeline: transcribe + process in one call."""
     data = request.get_json()
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
@@ -335,7 +336,7 @@ def run():
 
 @app.route('/transcribe', methods=['POST'])
 def transcribe_video():
-    """Transcribe only — returns transcript and speech timestamps."""
+    """Transcribe only."""
     data = request.get_json()
     raw_key = data.get('raw_key')
 
