@@ -61,6 +61,18 @@ def r2_upload_file(r2, local_path, key, content_type):
     return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
 
 
+def r2_upload_string(r2, content, key, content_type):
+    print(f"Uploading string to R2 as {key}")
+    r2.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=content.encode('utf-8'),
+        ContentType=content_type
+    )
+    print(f"Upload complete: {key}")
+    return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
+
+
 def get_video_duration(path):
     result = subprocess.run([
         'ffprobe', '-v', 'quiet',
@@ -248,17 +260,13 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
 
     transcript_url = None
     if transcript:
-        transcript_path = f'{work_dir}/transcript.txt'
-        with open(transcript_path, 'w') as f:
-            f.write(transcript)
         transcript_key = f'exports/{EXPORT_PREFIX}{raw_filename}.txt'
-        transcript_url = r2_upload_file(r2, transcript_path, transcript_key, 'text/plain')
+        transcript_url = r2_upload_string(r2, transcript, transcript_key, 'text/plain')
 
     return output_url, transcript_url
 
 
 def process_job(job_id, raw_key, cuts):
-    """Background thread that runs the full pipeline."""
     work_dir = f'/tmp/{job_id}'
     os.makedirs(work_dir, exist_ok=True)
 
@@ -266,7 +274,6 @@ def process_job(job_id, raw_key, cuts):
         jobs[job_id]['status'] = 'transcribing'
         r2 = get_r2_client()
 
-        # Step 1 — Transcribe
         print(f"[{job_id}] === STEP 1: TRANSCRIPTION ===")
         video_path = f'{work_dir}/raw_audio_source.mp4'
         audio_path = f'{work_dir}/audio.wav'
@@ -287,7 +294,6 @@ def process_job(job_id, raw_key, cuts):
         jobs[job_id]['speech_start'] = speech_start
         jobs[job_id]['speech_end'] = speech_end
 
-        # Step 2 — Process
         print(f"[{job_id}] === STEP 2: VIDEO PROCESSING ===")
         output_url, transcript_url = run_pipeline(
             r2, raw_key, cuts, transcript,
@@ -320,7 +326,6 @@ def health():
 
 @app.route('/run', methods=['POST'])
 def run():
-    """Start pipeline job — returns immediately with job_id."""
     data = request.get_json()
     raw_key = data.get('raw_key')
     cuts = data.get('cuts', [])
@@ -348,10 +353,28 @@ def run():
 
 @app.route('/status/<job_id>', methods=['GET'])
 def status(job_id):
-    """Poll job status."""
     if job_id not in jobs:
         return jsonify({'status': 'error', 'message': 'Job not found'}), 404
     return jsonify(jobs[job_id])
+
+
+@app.route('/save-thumbnail', methods=['POST'])
+def save_thumbnail():
+    data = request.get_json()
+    r2_key = data.get('r2_key')
+    content = data.get('content')
+
+    if not r2_key or not content:
+        return jsonify({'status': 'error', 'message': 'r2_key and content required'}), 400
+
+    try:
+        r2 = get_r2_client()
+        url = r2_upload_string(r2, content, r2_key, 'text/plain')
+        return jsonify({'status': 'complete', 'url': url})
+
+    except Exception as e:
+        print(f"Save thumbnail error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/transcribe', methods=['POST'])
