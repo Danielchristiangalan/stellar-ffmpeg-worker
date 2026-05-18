@@ -73,6 +73,18 @@ def r2_upload_string(r2, content, key, content_type):
     return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
 
 
+def r2_upload_bytes(r2, data, key, content_type):
+    print(f"Uploading {len(data)} bytes to R2 as {key}")
+    r2.put_object(
+        Bucket=R2_BUCKET_NAME,
+        Key=key,
+        Body=data,
+        ContentType=content_type
+    )
+    print(f"Upload complete: {key}")
+    return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com/{R2_BUCKET_NAME}/{key}"
+
+
 def get_video_duration(path):
     result = subprocess.run([
         'ffprobe', '-v', 'quiet',
@@ -86,18 +98,6 @@ def get_video_duration(path):
     return duration
 
 
-def convert_to_mp4(input_path, output_path):
-    """Convert non-MP4 video to MP4."""
-    print(f"Converting to MP4: {input_path} -> {output_path}")
-    subprocess.run([
-        'ffmpeg', '-y', '-i', input_path,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-        '-c:a', 'aac', '-ar', '48000',
-        output_path
-    ], check=True)
-    print("Conversion complete")
-
-
 def ensure_mp4(input_path, work_dir, prefix='converted'):
     """Return an MP4 path — converts if needed, returns original if already MP4."""
     ext = os.path.splitext(input_path)[1].lower()
@@ -105,7 +105,14 @@ def ensure_mp4(input_path, work_dir, prefix='converted'):
         print(f"Already MP4, no conversion needed")
         return input_path
     output_path = f'{work_dir}/{prefix}.mp4'
-    convert_to_mp4(input_path, output_path)
+    print(f"Converting {ext} to MP4: {input_path} -> {output_path}")
+    subprocess.run([
+        'ffmpeg', '-y', '-i', input_path,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        output_path
+    ], check=True)
+    print("Conversion complete")
     return output_path
 
 
@@ -180,9 +187,7 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     r2_download_file(r2, INTRO_PATH, intro_raw_path)
     r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
-    # Convert to MP4 if needed
     converted_path = ensure_mp4(raw_path, work_dir, prefix='raw_converted')
-
     raw_duration = get_video_duration(converted_path)
 
     trim_start = float(speech_start) if speech_start is not None else 0.0
@@ -307,10 +312,7 @@ def process_job(job_id, raw_key, cuts):
         audio_path = f'{work_dir}/audio.wav'
 
         r2_download_file(r2, raw_key, video_path)
-
-        # Convert to MP4 only if needed
         mp4_path = ensure_mp4(video_path, work_dir, prefix='audio_source_converted')
-
         extract_audio(mp4_path, audio_path)
         result = transcribe_with_groq(audio_path)
 
@@ -318,7 +320,6 @@ def process_job(job_id, raw_key, cuts):
         words = result.get('words', [])
         speech_start, speech_end = find_speech_boundaries(words)
 
-        # Clean up audio source files
         os.remove(video_path)
         if mp4_path != video_path and os.path.exists(mp4_path):
             os.remove(mp4_path)
@@ -398,16 +399,31 @@ def status(job_id):
 
 @app.route('/save-thumbnail', methods=['POST'])
 def save_thumbnail():
+    """Download JPEG from Placid URL and upload to R2."""
     data = request.get_json()
     r2_key = data.get('r2_key')
-    content = data.get('content')
+    image_url = data.get('content')
 
-    if not r2_key or not content:
+    if not r2_key or not image_url:
         return jsonify({'status': 'error', 'message': 'r2_key and content required'}), 400
 
     try:
         r2 = get_r2_client()
-        url = r2_upload_string(r2, content, r2_key, 'text/plain')
+
+        # Download the JPEG from Placid
+        print(f"Downloading thumbnail from: {image_url}")
+        response = http_requests.get(image_url, timeout=30)
+        if response.status_code != 200:
+            raise Exception(f"Failed to download thumbnail: {response.status_code}")
+
+        image_data = response.content
+        print(f"Downloaded thumbnail: {len(image_data)} bytes")
+
+        # Change extension to .jpg
+        jpg_key = r2_key.replace('.txt', '.jpg')
+
+        # Upload JPEG to R2
+        url = r2_upload_bytes(r2, image_data, jpg_key, 'image/jpeg')
         return jsonify({'status': 'complete', 'url': url})
 
     except Exception as e:
