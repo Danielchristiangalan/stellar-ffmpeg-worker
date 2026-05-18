@@ -86,6 +86,24 @@ def get_video_duration(path):
     return duration
 
 
+def convert_to_mp4(input_path, output_path):
+    """Convert any video format to MP4. If already MP4, just copy."""
+    ext = os.path.splitext(input_path)[1].lower()
+    if ext == '.mp4':
+        print(f"Already MP4, skipping conversion")
+        import shutil
+        shutil.copy2(input_path, output_path)
+    else:
+        print(f"Converting {ext} to MP4")
+        subprocess.run([
+            'ffmpeg', '-y', '-i', input_path,
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+            '-c:a', 'aac', '-ar', '48000',
+            output_path
+        ], check=True)
+        print("Conversion complete")
+
+
 def extract_audio(video_path, audio_path):
     subprocess.run([
         'ffmpeg', '-y', '-i', video_path,
@@ -140,7 +158,8 @@ def find_speech_boundaries(words):
 
 
 def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id, work_dir):
-    raw_path = f'{work_dir}/raw.mp4'
+    raw_path = f'{work_dir}/raw_original'
+    converted_path = f'{work_dir}/raw.mp4'
     trimmed_path = f'{work_dir}/trimmed.mp4'
     cut_path = f'{work_dir}/cut.mp4'
     padded_path = f'{work_dir}/padded.mp4'
@@ -151,12 +170,19 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     concat_list_path = f'{work_dir}/concat.txt'
     output_path = f'{work_dir}/final.mp4'
 
+    # Determine file extension from raw_key
+    ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
+    raw_path = f'{work_dir}/raw_original{ext}'
+
     print(f"Downloading raw video: {raw_key}")
     r2_download_file(r2, raw_key, raw_path)
     r2_download_file(r2, INTRO_PATH, intro_raw_path)
     r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
-    raw_duration = get_video_duration(raw_path)
+    # Convert to MP4 if needed
+    convert_to_mp4(raw_path, converted_path)
+
+    raw_duration = get_video_duration(converted_path)
 
     trim_start = float(speech_start) if speech_start is not None else 0.0
     trim_end = float(speech_end) if speech_end is not None else raw_duration
@@ -186,7 +212,7 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
 
     print("Pass 1: Trimming to speech start/end")
     subprocess.run([
-        'ffmpeg', '-y', '-i', raw_path,
+        'ffmpeg', '-y', '-i', converted_path,
         '-ss', str(trim_start),
         '-t', str(trim_duration),
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
@@ -253,6 +279,7 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         output_path
     ], check=True)
 
+    # Use original filename without extension for export naming
     raw_filename = os.path.splitext(os.path.basename(raw_key))[0]
     video_key = f'exports/{EXPORT_PREFIX}{raw_filename}.mp4'
     print(f"Export filename: {video_key}")
@@ -263,7 +290,7 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         transcript_key = f'exports/{EXPORT_PREFIX}{raw_filename}.txt'
         transcript_url = r2_upload_string(r2, transcript, transcript_key, 'text/plain')
 
-    return output_url, transcript_url
+    return output_url, transcript_url, raw_filename
 
 
 def process_job(job_id, raw_key, cuts):
@@ -275,11 +302,16 @@ def process_job(job_id, raw_key, cuts):
         r2 = get_r2_client()
 
         print(f"[{job_id}] === STEP 1: TRANSCRIPTION ===")
-        video_path = f'{work_dir}/raw_audio_source.mp4'
+        ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
+        video_path = f'{work_dir}/raw_audio_source{ext}'
+        converted_audio_path = f'{work_dir}/raw_audio_source.mp4'
         audio_path = f'{work_dir}/audio.wav'
 
         r2_download_file(r2, raw_key, video_path)
-        extract_audio(video_path, audio_path)
+
+        # Convert to MP4 for audio extraction if needed
+        convert_to_mp4(video_path, converted_audio_path)
+        extract_audio(converted_audio_path, audio_path)
         result = transcribe_with_groq(audio_path)
 
         transcript = result.get('text', '').strip()
@@ -287,15 +319,17 @@ def process_job(job_id, raw_key, cuts):
         speech_start, speech_end = find_speech_boundaries(words)
 
         os.remove(video_path)
+        os.remove(converted_audio_path)
         os.remove(audio_path)
 
         jobs[job_id]['status'] = 'processing'
         jobs[job_id]['transcript'] = transcript
         jobs[job_id]['speech_start'] = speech_start
         jobs[job_id]['speech_end'] = speech_end
+        jobs[job_id]['raw_key'] = raw_key
 
         print(f"[{job_id}] === STEP 2: VIDEO PROCESSING ===")
-        output_url, transcript_url = run_pipeline(
+        output_url, transcript_url, raw_filename = run_pipeline(
             r2, raw_key, cuts, transcript,
             speech_start, speech_end,
             job_id, work_dir
@@ -307,6 +341,8 @@ def process_job(job_id, raw_key, cuts):
             'status': 'complete',
             'output_url': output_url,
             'transcript_url': transcript_url,
+            'raw_key': raw_key,
+            'raw_filename': raw_filename,
         })
         print(f"[{job_id}] Job complete")
 
@@ -389,13 +425,16 @@ def transcribe_video():
     work_dir = f'/tmp/transcribe_{job_id}'
     os.makedirs(work_dir, exist_ok=True)
 
-    video_path = f'{work_dir}/raw.mp4'
+    ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
+    video_path = f'{work_dir}/raw{ext}'
+    converted_path = f'{work_dir}/raw.mp4'
     audio_path = f'{work_dir}/audio.wav'
 
     try:
         r2 = get_r2_client()
         r2_download_file(r2, raw_key, video_path)
-        extract_audio(video_path, audio_path)
+        convert_to_mp4(video_path, converted_path)
+        extract_audio(converted_path, audio_path)
         result = transcribe_with_groq(audio_path)
 
         transcript = result.get('text', '').strip()
@@ -435,7 +474,7 @@ def process_video():
 
     try:
         r2 = get_r2_client()
-        output_url, transcript_url = run_pipeline(
+        output_url, transcript_url, _ = run_pipeline(
             r2, raw_key, cuts, transcript,
             speech_start, speech_end,
             job_id, work_dir
