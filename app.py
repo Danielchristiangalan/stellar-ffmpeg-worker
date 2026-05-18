@@ -363,6 +363,16 @@ def health():
     return jsonify({'status': 'ok'})
 
 
+@app.route('/active-job', methods=['GET'])
+def active_job():
+    """Check if any job is currently running."""
+    active = any(
+        j.get('status') in ('queued', 'transcribing', 'processing')
+        for j in jobs.values()
+    )
+    return jsonify({'active': active, 'total_jobs': len(jobs)})
+
+
 @app.route('/run', methods=['POST'])
 def run():
     data = request.get_json()
@@ -371,6 +381,17 @@ def run():
 
     if not raw_key:
         return jsonify({'status': 'error', 'message': 'raw_key required'}), 400
+
+    # Reject if a job is already running
+    active = any(
+        j.get('status') in ('queued', 'transcribing', 'processing')
+        for j in jobs.values()
+    )
+    if active:
+        return jsonify({
+            'status': 'busy',
+            'message': 'A job is already running. Try again later.'
+        }), 429
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
@@ -410,7 +431,6 @@ def save_thumbnail():
     try:
         r2 = get_r2_client()
 
-        # Download the JPEG from Placid
         print(f"Downloading thumbnail from: {image_url}")
         response = http_requests.get(image_url, timeout=30)
         if response.status_code != 200:
@@ -419,10 +439,7 @@ def save_thumbnail():
         image_data = response.content
         print(f"Downloaded thumbnail: {len(image_data)} bytes")
 
-        # Change extension to .jpg
         jpg_key = r2_key.replace('.txt', '.jpg')
-
-        # Upload JPEG to R2
         url = r2_upload_bytes(r2, image_data, jpg_key, 'image/jpeg')
         return jsonify({'status': 'complete', 'url': url})
 
