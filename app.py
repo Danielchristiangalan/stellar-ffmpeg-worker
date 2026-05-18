@@ -87,21 +87,26 @@ def get_video_duration(path):
 
 
 def convert_to_mp4(input_path, output_path):
-    """Convert any video format to MP4. If already MP4, just copy."""
+    """Convert non-MP4 video to MP4."""
+    print(f"Converting to MP4: {input_path} -> {output_path}")
+    subprocess.run([
+        'ffmpeg', '-y', '-i', input_path,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+        '-c:a', 'aac', '-ar', '48000',
+        output_path
+    ], check=True)
+    print("Conversion complete")
+
+
+def ensure_mp4(input_path, work_dir, prefix='converted'):
+    """Return an MP4 path — converts if needed, returns original if already MP4."""
     ext = os.path.splitext(input_path)[1].lower()
     if ext == '.mp4':
-        print(f"Already MP4, skipping conversion")
-        import shutil
-        shutil.copy2(input_path, output_path)
-    else:
-        print(f"Converting {ext} to MP4")
-        subprocess.run([
-            'ffmpeg', '-y', '-i', input_path,
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
-            '-c:a', 'aac', '-ar', '48000',
-            output_path
-        ], check=True)
-        print("Conversion complete")
+        print(f"Already MP4, no conversion needed")
+        return input_path
+    output_path = f'{work_dir}/{prefix}.mp4'
+    convert_to_mp4(input_path, output_path)
+    return output_path
 
 
 def extract_audio(video_path, audio_path):
@@ -158,8 +163,8 @@ def find_speech_boundaries(words):
 
 
 def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id, work_dir):
-    raw_path = f'{work_dir}/raw_original'
-    converted_path = f'{work_dir}/raw.mp4'
+    ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
+    raw_path = f'{work_dir}/raw_original{ext}'
     trimmed_path = f'{work_dir}/trimmed.mp4'
     cut_path = f'{work_dir}/cut.mp4'
     padded_path = f'{work_dir}/padded.mp4'
@@ -170,17 +175,13 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
     concat_list_path = f'{work_dir}/concat.txt'
     output_path = f'{work_dir}/final.mp4'
 
-    # Determine file extension from raw_key
-    ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
-    raw_path = f'{work_dir}/raw_original{ext}'
-
     print(f"Downloading raw video: {raw_key}")
     r2_download_file(r2, raw_key, raw_path)
     r2_download_file(r2, INTRO_PATH, intro_raw_path)
     r2_download_file(r2, OUTRO_PATH, outro_raw_path)
 
     # Convert to MP4 if needed
-    convert_to_mp4(raw_path, converted_path)
+    converted_path = ensure_mp4(raw_path, work_dir, prefix='raw_converted')
 
     raw_duration = get_video_duration(converted_path)
 
@@ -279,7 +280,6 @@ def run_pipeline(r2, raw_key, cuts, transcript, speech_start, speech_end, job_id
         output_path
     ], check=True)
 
-    # Use original filename without extension for export naming
     raw_filename = os.path.splitext(os.path.basename(raw_key))[0]
     video_key = f'exports/{EXPORT_PREFIX}{raw_filename}.mp4'
     print(f"Export filename: {video_key}")
@@ -304,22 +304,24 @@ def process_job(job_id, raw_key, cuts):
         print(f"[{job_id}] === STEP 1: TRANSCRIPTION ===")
         ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
         video_path = f'{work_dir}/raw_audio_source{ext}'
-        converted_audio_path = f'{work_dir}/raw_audio_source.mp4'
         audio_path = f'{work_dir}/audio.wav'
 
         r2_download_file(r2, raw_key, video_path)
 
-        # Convert to MP4 for audio extraction if needed
-        convert_to_mp4(video_path, converted_audio_path)
-        extract_audio(converted_audio_path, audio_path)
+        # Convert to MP4 only if needed
+        mp4_path = ensure_mp4(video_path, work_dir, prefix='audio_source_converted')
+
+        extract_audio(mp4_path, audio_path)
         result = transcribe_with_groq(audio_path)
 
         transcript = result.get('text', '').strip()
         words = result.get('words', [])
         speech_start, speech_end = find_speech_boundaries(words)
 
+        # Clean up audio source files
         os.remove(video_path)
-        os.remove(converted_audio_path)
+        if mp4_path != video_path and os.path.exists(mp4_path):
+            os.remove(mp4_path)
         os.remove(audio_path)
 
         jobs[job_id]['status'] = 'processing'
@@ -427,14 +429,13 @@ def transcribe_video():
 
     ext = os.path.splitext(raw_key)[1].lower() or '.mp4'
     video_path = f'{work_dir}/raw{ext}'
-    converted_path = f'{work_dir}/raw.mp4'
     audio_path = f'{work_dir}/audio.wav'
 
     try:
         r2 = get_r2_client()
         r2_download_file(r2, raw_key, video_path)
-        convert_to_mp4(video_path, converted_path)
-        extract_audio(converted_path, audio_path)
+        mp4_path = ensure_mp4(video_path, work_dir, prefix='transcribe_converted')
+        extract_audio(mp4_path, audio_path)
         result = transcribe_with_groq(audio_path)
 
         transcript = result.get('text', '').strip()
